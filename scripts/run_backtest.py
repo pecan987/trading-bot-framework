@@ -15,6 +15,7 @@ from data import YahooFinanceSource, CCXTSource, CSVDataSource
 from strategies.trend_following import SMAStrategy
 from strategies.mean_reversion import MeanReversion
 from strategies.breakout_strategy import BreakoutStrategy
+from strategies.sfp_strategy import SFPStrategy
 from utils.logger import setup_logger
 
 def run_backtest(strategy_name: str, symbol: str, start_date: str, end_date: str, data_source: str = None, timeframe: str = None, debug: bool = False, no_sl_tp: bool = False):
@@ -85,6 +86,8 @@ def run_backtest(strategy_name: str, symbol: str, start_date: str, end_date: str
         strategy_class = MeanReversion
     elif strategy_name.lower() in ["breakout", "breakout_strategy"]:
         strategy_class = BreakoutStrategy
+    elif strategy_name.lower() in ["sfp"]:
+        strategy_class = SFPStrategy
     else:
         logger.error(f"Unknown strategy: {strategy_name}")
         return None
