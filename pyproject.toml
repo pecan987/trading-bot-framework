@@ -26,7 +26,7 @@ classifiers = [
 dependencies = [
     # Core dependencies - essential for framework
     "pandas>=2.0.0",
-    "numpy>=1.24.0,<2.0.0",
+    "numpy>=1.24.0",  # Allow numpy 2.x for pandas-ta compatibility
     # Data sources - required for download and backtesting
     "yfinance>=0.2.18", # Yahoo Finance data
     "ccxt>=4.2.0", # Cryptocurrency exchange data
@@ -36,6 +36,9 @@ dependencies = [
     "seaborn>=0.13.2",
     "pandas-ta>=0.3.14b0",
     "tqdm>=4.67.1",
+    # Live trading dependencies
+    "python-dotenv",
+    "psycopg2-binary",  # PostgreSQL adapter
 ]
 
 [project.optional-dependencies]
