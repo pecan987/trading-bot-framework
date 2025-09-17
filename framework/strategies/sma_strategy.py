@@ -38,6 +38,7 @@ class SMAStrategy(BaseStrategy):
         self.position_size = position_size
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
+        self.min_bars_required = max(short_window, long_window) + 1  # Need enough data for moving averages
         
     def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
         """

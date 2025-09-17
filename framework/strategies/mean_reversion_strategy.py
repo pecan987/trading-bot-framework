@@ -55,6 +55,7 @@ class MeanReversionStrategy(BaseStrategy):
         
         super().__init__("MeanReversion", parameters)
         self.params = parameters
+        self.min_bars_required = max(lookback_period, rsi_period, atr_period, adx_period) + 10  # Need enough data for all indicators
         
     def get_strategy_name(self) -> str:
         return f"MeanReversion_{self.params['lookback_period']}_{self.params['z_threshold']}"

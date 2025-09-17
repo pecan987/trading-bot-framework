@@ -41,6 +41,7 @@ class BreakoutStrategy(BaseStrategy):
         
         super().__init__("Breakout", parameters)
         self.params = parameters
+        self.min_bars_required = max(swing_sensitivity, bos_lookback, obv_period, atr_period) + 10  # Need enough data for all indicators
         
     def get_strategy_name(self) -> str:
         return f"LiquidityBreakout_{self.params['swing_sensitivity']}_{self.params['bos_lookback']}"
