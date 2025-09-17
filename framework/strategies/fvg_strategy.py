@@ -67,6 +67,7 @@ class FVGStrategy(BaseStrategy):
         self.max_hold_hours = max_hold_hours
         self.min_fvg_sensitivity = min_fvg_sensitivity
         self.position_size = position_size
+        self.min_bars_required = max(h1_lookback_candles, h4_lookback_candles) + 20  # Need enough data for FVG detection
         self.h1_lookback_candles = h1_lookback_candles
         self.h4_lookback_candles = h4_lookback_candles
         

@@ -1,224 +1,168 @@
-#!/usr/bin/env python3
 """
-Main entry point for live trading bot
+Main entry point for trading bot - adapted from old branch to work with current framework
 """
 import os
 import sys
-import json
-import logging
 import signal
-from pathlib import Path
+import time
 from dotenv import load_dotenv
 
-# Add project root to path
-sys.path.append(str(Path(__file__).parent))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from framework.utils.logger import setup_logger
-from framework.live.db_manager import DatabaseManager
-from framework.live.trading_engine import TradingEngine
-from framework.live.brokers.ccxt_broker import CCXTBroker
-from framework.live.brokers.paper_broker import PaperBroker
-
-# Import strategies
 from framework.strategies.sma_strategy import SMAStrategy
 from framework.strategies.breakout_strategy import BreakoutStrategy
 from framework.strategies.fvg_strategy import FVGStrategy
 from framework.strategies.mean_reversion_strategy import MeanReversionStrategy
+from framework.strategies.test_strategy import TestStrategy
 
 
-def create_broker(broker_type: str, config: dict = None):
-    """
-    Factory function to create appropriate broker
-    
-    Args:
-        broker_type: Type of broker (ccxt, paper_ccxt, ibkr, paper_ibkr)
-        config: Broker configuration
-    
-    Returns:
-        Broker instance
-    """
-    if broker_type == "ccxt":
-        return CCXTBroker(
-            exchange_name=os.getenv('CCXT_EXCHANGE', 'binance'),
-            api_key=os.getenv('CCXT_API_KEY'),
-            api_secret=os.getenv('CCXT_API_SECRET'),
-            testnet=os.getenv('CCXT_TESTNET', 'true').lower() == 'true',
-            config=config
-        )
-    
-    elif broker_type == "paper_ccxt":
-        # Create CCXT broker for data
-        data_broker = CCXTBroker(
-            exchange_name=os.getenv('CCXT_EXCHANGE', 'binance'),
-            api_key=os.getenv('CCXT_API_KEY'),
-            api_secret=os.getenv('CCXT_API_SECRET'),
-            testnet=os.getenv('CCXT_TESTNET', 'true').lower() == 'true',
-            config=config
-        )
+# Simple config class using environment variables
+class SimpleConfig:
+    def __init__(self):
+        load_dotenv()
         
-        # Wrap in paper trading
-        return PaperBroker(
-            data_broker=data_broker,
-            initial_capital=float(os.getenv('INITIAL_CAPITAL', 10000)),
-            commission_rate=float(os.getenv('COMMISSION_RATE', 0.001)),
-            slippage_rate=float(os.getenv('SLIPPAGE_RATE', 0.0005))
-        )
-    
-    # TODO: Add IBKR broker support
-    elif broker_type in ["ibkr", "paper_ibkr"]:
-        raise NotImplementedError(f"Broker {broker_type} not yet implemented")
-    
-    else:
-        raise ValueError(f"Unknown broker type: {broker_type}")
+        # Broker settings
+        self.broker = os.getenv('BROKER', 'paper_ccxt')
+        self.exchange_name = os.getenv('EXCHANGE_NAME', 'binance')
+        self.symbols = [s.strip() for s in os.getenv('SYMBOLS', 'BTC/USDT:USDT').split(',')]
+        self.timeframe = os.getenv('TIMEFRAME', '1m')
+        self.use_sandbox = os.getenv('USE_SANDBOX', 'true').lower() == 'true'
+        
+        # API keys
+        self.exchange_api_key = os.getenv('EXCHANGE_API_KEY', '')
+        self.exchange_api_secret = os.getenv('EXCHANGE_API_SECRET', '')
+        # Additional config for ccxt_trader compatibility
+        self.api_key = self.exchange_api_key
+        self.api_secret = self.exchange_api_secret
+        
+        # Trading configuration
+        self.trading_type = os.getenv('TRADING_TYPE', 'future')  # 'spot' or 'future'
+        self.allow_shorting = os.getenv('ALLOW_SHORTING', 'true').lower() == 'true'
+        
+        # Fees and slippage simulation (for paper trading)
+        self.commission = float(os.getenv('COMMISSION_RATE', '0.001'))  # 0.1% default
+        self.slippage = float(os.getenv('SLIPPAGE_RATE', '0.0005'))    # 0.05% default
+        
+        # Strategy
+        self.strategy_name = os.getenv('STRATEGY_NAME', 'sma')
+        self.strategy_params = {}
+        
+        # Risk management
+        self.initial_capital = float(os.getenv('INITIAL_CAPITAL', '10000.0'))
+        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', '0.1'))
+        
+        # Logging
+        self.log_level = os.getenv('LOG_LEVEL', 'INFO')
+        self.use_json_logs = os.getenv('USE_JSON_LOGS', 'false').lower() == 'true'
 
 
-def create_strategy(strategy_name: str, params: dict = None):
-    """
-    Factory function to create strategy
-    
-    Args:
-        strategy_name: Name of strategy
-        params: Strategy parameters
-    
-    Returns:
-        Strategy instance
-    """
-    # Parse strategy params from environment
-    if params is None:
-        params_str = os.getenv('STRATEGY_PARAMS', '{}')
-        try:
-            params = json.loads(params_str)
-        except:
-            params = {}
-    
-    # Create strategy - all strategies use same pattern
-    if strategy_name.lower() == "sma":
-        return SMAStrategy(**params) if params else SMAStrategy()
-    elif strategy_name.lower() == "breakout":
-        return BreakoutStrategy(**params) if params else BreakoutStrategy()
-    elif strategy_name.lower() == "fvg":
-        return FVGStrategy(**params) if params else FVGStrategy()
-    elif strategy_name.lower() == "mean_reversion":
-        return MeanReversionStrategy(**params) if params else MeanReversionStrategy()
-    else:
-        raise ValueError(f"Unknown strategy: {strategy_name}")
+def main() -> None:
+    """Main trading bot function"""
+    # Load configuration
+    config = SimpleConfig()
 
-
-def main():
-    """Main function"""
-    # Load environment variables
-    load_dotenv()
-    
     # Setup logging
-    log_level = os.getenv('LOG_LEVEL', 'INFO')
-    logger = setup_logger(log_level)
+    from framework.utils.logger import setup_logger
+    logger = setup_logger(config.log_level)
+    logger.info("Starting trading bot...")
     
-    # Global reference for cleanup
-    engine = None
+    # Global trader reference for signal handler
+    trader = None
     
     def signal_handler(signum, frame):
-        logger.info(f"🛑 Received signal {signum}, shutting down gracefully...")
-        if engine:
-            engine.is_running = False  # Stop the loop immediately
-            engine.stop()
-        logger.info("✅ Trading bot stopped")
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        if trader and hasattr(trader, 'shutdown'):
+            trader.shutdown()
         sys.exit(0)
     
-    # Setup signal handlers
+    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    logger.info("=" * 50)
-    logger.info("Starting Trading Bot")
-    logger.info("=" * 50)
+    # Select strategy based on configuration
+    if config.strategy_name.lower() == "sma":
+        strategy = SMAStrategy()
+    elif config.strategy_name.lower() == "breakout":
+        strategy = BreakoutStrategy()
+    elif config.strategy_name.lower() == "fvg":
+        strategy = FVGStrategy()
+    elif config.strategy_name.lower() == "mean_reversion":
+        strategy = MeanReversionStrategy()
+    elif config.strategy_name.lower() == "test":
+        strategy = TestStrategy()
+    else:
+        # Default to SMA
+        logger.warning(f"Unknown strategy {config.strategy_name}, defaulting to SMA")
+        strategy = SMAStrategy()
     
-    try:
-        # Get configuration from environment
-        broker_type = os.getenv('BROKER', 'paper_ccxt')
-        strategy_name = os.getenv('STRATEGY', 'breakout')
-        symbol = os.getenv('SYMBOL', 'BTC/USDT')
-        timeframe = os.getenv('TIMEFRAME', '15m')
-        
-        # Risk management settings
-        position_size = float(os.getenv('MAX_POSITION_PCT', 0.1))
-        stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', 0.02))
-        take_profit_pct = float(os.getenv('TAKE_PROFIT_PCT', 0.04))
-        risk_per_trade = float(os.getenv('RISK_PER_TRADE', 0.01))
-        
-        # Safety settings
-        paper_trading = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
-        
-        # Override broker if paper trading is forced
-        if paper_trading and not broker_type.startswith('paper_'):
-            logger.warning(f"Paper trading mode enabled, switching from {broker_type} to paper_{broker_type}")
-            broker_type = f"paper_{broker_type}"
-        
-        logger.info(f"Configuration:")
-        logger.info(f"  Broker: {broker_type}")
-        logger.info(f"  Strategy: {strategy_name}")
-        logger.info(f"  Symbol: {symbol}")
-        logger.info(f"  Timeframe: {timeframe}")
-        logger.info(f"  Position Size: {position_size * 100}%")
-        logger.info(f"  Stop Loss: {stop_loss_pct * 100}%")
-        logger.info(f"  Take Profit: {take_profit_pct * 100}%")
-        
-        # Create broker
-        logger.info(f"Creating {broker_type} broker...")
-        broker = create_broker(broker_type)
-        
-        # Create strategy
-        logger.info(f"Creating {strategy_name} strategy...")
-        strategy = create_strategy(strategy_name)
-        
-        # Create database manager (optional)
-        db_manager = None
-        if os.getenv('DB_HOST'):
-            logger.info("Connecting to database...")
-            db_manager = DatabaseManager()
-        
-        # Create trading engine
-        engine = TradingEngine(
-            broker=broker,
-            strategy=strategy,
-            symbol=symbol,
-            timeframe=timeframe,
-            lookback_periods=int(os.getenv('LOOKBACK_PERIODS', 100)),
-            db_manager=db_manager,
-            position_size=position_size,
-            max_positions=int(os.getenv('MAX_POSITIONS', 1)),
-            stop_loss_pct=stop_loss_pct,
-            take_profit_pct=take_profit_pct,
-            risk_per_trade=risk_per_trade,
-            use_risk_management=os.getenv('USE_RISK_MANAGEMENT', 'true').lower() == 'true'
-        )
-        
-        # Start trading
-        logger.info("Starting trading engine...")
-        logger.info("Press Ctrl+C to stop")
-        
+    # Initialize trader based on broker selection
+    if config.broker == "paper_ccxt":
+        # Paper trading with real market data (SAFE)
+        from framework.execution.ccxt.ccxt_paper_trader import CCXTPaperTrader
+        trader = CCXTPaperTrader(config)
+        logger.info("Using PAPER TRADING with real market data")
+    elif config.broker == "ccxt":
+        # Live trading with real money (DANGEROUS)
+        from framework.execution.ccxt.ccxt_trader import CCXTTrader
+        trader = CCXTTrader(config)
+        logger.warning("🚨 USING LIVE TRADING WITH REAL MONEY 🚨")
+    else:
+        raise ValueError(f"Unknown broker: {config.broker}. Use 'paper_ccxt' or 'ccxt'")
+
+    logger.info(f"Using strategy: {strategy.__class__.__name__}")
+
+    # Announce trading mode
+    data_source = "SANDBOX" if config.use_sandbox else "LIVE DATA"
+    if config.broker == "paper_ccxt":
+        logger.warning(f"Starting PAPER TRADING with {data_source} - Virtual money only!")
+    else:
+        logger.warning(f"Starting LIVE TRADING with {data_source} - REAL MONEY AT RISK!")
+
+    # Main trading loop
+    while True:
         try:
-            engine.start()
+            # Process each symbol using the proven trading cycle
+            for symbol in config.symbols:
+                trader.run_trading_cycle(symbol, strategy)
+
+            # Get performance summary
+            performance = trader.get_performance_summary()
+            logger.info(
+                "Performance summary",
+                extra={
+                    'daily_pnl': performance.get('daily_pnl', 0),
+                    'open_positions': performance.get('open_positions', 0),
+                    'initial_balance': performance.get('initial_balance', 0),
+                    'current_balance': performance.get('current_balance', 0),
+                    'total_pnl': performance.get('total_pnl', 0),
+                    'emergency_stop': performance.get('emergency_stop', False),
+                    'trading_mode': performance.get('mode', 'UNKNOWN')
+                }
+            )
+
+            # Calculate sleep time until next candle
+            timeframe_map = {
+                '1m': 60, '5m': 300, '15m': 900, '30m': 1800, 
+                '1h': 3600, '4h': 14400, '1d': 86400
+            }
+            timeframe_seconds = timeframe_map.get(config.timeframe, 60)
+            
+            sleep_time = timeframe_seconds - (time.time() % timeframe_seconds)
+
+            if sleep_time > 5:
+                logger.info(f"💤 Sleeping {sleep_time:.0f}s until next {config.timeframe} candle...")
+                time.sleep(sleep_time)
+            else:
+                # If too close to next candle, wait for the one after
+                time.sleep(sleep_time + timeframe_seconds)
+
         except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-            engine.stop()
+            logger.info("Shutting down...")
+            break
         except Exception as e:
-            logger.error(f"Engine error: {e}")
-            engine.stop()
-            raise
-        
-    except KeyboardInterrupt:
-        logger.info("Shutdown requested by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        sys.exit(1)
-    finally:
-        if 'engine' in locals():
-            engine.stop()
-        if 'db_manager' in locals() and db_manager:
-            db_manager.close()
-        logger.info("Trading bot stopped")
+            logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
+            time.sleep(60)  # Wait before retry
 
 
 if __name__ == "__main__":

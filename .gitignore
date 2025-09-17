@@ -9,13 +9,11 @@ data/cleaned/
 *.hdf5
 
 # Output files
-output/backtests/
-output/tests/
-output/reports/
-output/logs/
-output/optimizations/
-output/walk_forward/
+output/*
 logs/
+
+# Trading state files (paper trading persistence)
+trading_state/
 
 # Python
 __pycache__/
