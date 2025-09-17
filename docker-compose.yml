@@ -18,6 +18,53 @@ services:
       timeout: 5s
       retries: 5
 
+  # IB Gateway service for Interactive Brokers trading
+  # Only starts when BROKER=ibkr in .env file
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib_gateway
+    restart: unless-stopped
+    environment:
+      # Interactive Brokers credentials (set in .env file)
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+
+      # Trading mode: paper or live
+      TRADING_MODE: ${GATEWAY_TRADING_MODE:-paper}
+
+      # Optional VNC access
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+
+      # Accept incoming connections
+      TWS_ACCEPT_INCOMING: "yes"
+
+      # Timezone
+      TIME_ZONE: ${TZ:-America/New_York}
+
+    ports:
+      # Map IB Gateway API ports to host
+      - "127.0.0.1:4001:4001"  # Live API port
+      - "127.0.0.1:4002:4002"  # Paper API port
+
+      # VNC port (optional, for GUI access)
+      - "127.0.0.1:5900:5900"
+
+    volumes:
+      # Persist IB Gateway settings and logs
+      - ib_gateway_data:/opt/ibc
+      - ib_gateway_logs:/root/Jts
+
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -an | grep -q ':400[12].*LISTEN' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+    # Only start if using IBKR broker
+    profiles:
+      - ibkr
+
   trading_bot:
     build:
       context: .
@@ -29,6 +76,8 @@ services:
     environment:
       - DB_HOST=postgres
       - DB_PORT=5432
+      # Override IBKR connection to use Docker Gateway when using IBKR
+      - IBKR_HOST=ib-gateway
     depends_on:
       postgres:
         condition: service_healthy
@@ -37,3 +86,5 @@ services:
 
 volumes:
   postgres_data:
+  ib_gateway_data:
+  ib_gateway_logs:

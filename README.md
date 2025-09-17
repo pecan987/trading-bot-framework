@@ -6,9 +6,14 @@ A comprehensive Python framework for algorithmic trading strategy development, b
 
 - **Strategy Development**: Modular architecture with abstract base classes for consistent strategy implementation
 - **Backtesting Engine**: Comprehensive backtesting with risk management integration and performance metrics
-- **Data Management**: Support for multiple data sources (Yahoo Finance, CCXT exchanges)
+- **Live Trading Support**: 
+  - **CCXT**: Cryptocurrency exchanges (Binance, Coinbase, Kraken, etc.)
+  - **IBKR**: Interactive Brokers for stocks, ETFs, forex, and futures
+  - **Paper Trading**: Risk-free testing with real market data
+- **Data Management**: Support for multiple data sources (Yahoo Finance, CCXT exchanges, Interactive Brokers)
 - **Risk Management**: Built-in position sizing, stop-loss, and portfolio risk controls
 - **Performance Analysis**: Detailed metrics including Sharpe ratio, maximum drawdown, and win rates
+- **Docker Integration**: Containerized deployment with IB Gateway support
 
 ## Installation
 
@@ -94,6 +99,56 @@ uv run python scripts/run_backtest.py --strategy sma --data-file data/cleaned/BT
 - **Risk Management**: Built-in stop loss, take profit, and position sizing
 - **Strategy Development**: Extensible framework for custom trading strategies
 
+## Broker Support
+
+### Cryptocurrency Exchanges (CCXT)
+Supports 100+ cryptocurrency exchanges through CCXT:
+- **Binance**, **Coinbase**, **Kraken**, **Bybit**, **OKX**, etc.
+- Paper trading with real market data
+- Live trading with API keys
+
+### Interactive Brokers (IBKR) 
+Professional broker for traditional assets:
+- **Stocks**, **ETFs**, **Forex**, **Futures**, **Options**
+- Paper trading and live trading
+- Integrated with IB Gateway Docker for easy deployment
+- See [IBKR Integration Guide](docs/IBKR_INTEGRATION.md) for setup
+
+### Quick Broker Setup
+
+#### CCXT Paper Trading (Recommended for beginners)
+```bash
+# Copy environment template
+cp .env.example .env
+
+# Edit .env file:
+BROKER=paper_ccxt
+EXCHANGE_NAME=binance
+SYMBOLS=BTC/USDT:USDT
+STRATEGY_NAME=test
+
+# Run trading bot
+uv run python main.py
+```
+
+#### IBKR Trading (Advanced)
+```bash
+# 1. Set up IB Gateway with Docker
+cp .env.example .env
+
+# 2. Configure IBKR settings in .env:
+BROKER=ibkr
+TWS_USERID=your_ibkr_username
+TWS_PASSWORD=your_ibkr_password
+SYMBOLS=AAPL,SPY,EUR.USD
+IBKR_ACCOUNT_TYPE=paper
+
+# 3. Start with IBKR profile (includes IB Gateway)
+docker-compose --profile ibkr up
+
+# See docs/IBKR_INTEGRATION.md for detailed setup
+```
+
 ## Testing
 
 ```bash
@@ -102,6 +157,9 @@ python -m pytest tests/
 
 # Run with coverage
 python -m pytest tests/ --cov=framework
+
+# Test IBKR integration
+python simple_ibkr_test.py
 ```
 
 ## Contributing

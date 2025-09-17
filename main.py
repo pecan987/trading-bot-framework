@@ -87,6 +87,58 @@ class SimpleConfig:
         return params
 
 
+async def run_ibkr_trading_cycle(trader, symbols: list, strategy):
+    """Run IBKR trading cycle asynchronously"""
+    for symbol in symbols:
+        try:
+            # Get market data
+            df = await trader.get_market_data(symbol, trader.config.timeframe)
+            if df is None or len(df) < strategy.min_bars_required:
+                continue
+            
+            # Generate signals
+            signals = strategy.generate_signals(df)
+            if signals is None or len(signals) == 0:
+                continue
+            
+            latest_signal = signals['signal'].iloc[-1]
+            current_price = df['close'].iloc[-1]
+            
+            # Execute trade
+            await trader.execute_trade(symbol, latest_signal, current_price, strategy)
+            
+        except Exception as e:
+            trader.logger.error(f"Error in IBKR trading cycle for {symbol}: {e}")
+
+
+def get_performance_summary(trader, broker_type: str) -> dict:
+    """Get performance summary for any trader type"""
+    try:
+        if broker_type == "ibkr":
+            return {
+                'daily_pnl': trader.get_daily_pnl(),
+                'open_positions': len(trader.get_positions()),
+                'initial_balance': trader.get_balance(),
+                'current_balance': trader.get_balance() + trader.get_daily_pnl(),
+                'total_pnl': trader.get_daily_pnl(),
+                'emergency_stop': trader.is_emergency_stop(),
+                'mode': 'IBKR'
+            }
+        else:
+            # CCXT traders
+            return trader.get_performance_summary()
+    except Exception as e:
+        return {
+            'daily_pnl': 0,
+            'open_positions': 0, 
+            'initial_balance': 0,
+            'current_balance': 0,
+            'total_pnl': 0,
+            'emergency_stop': False,
+            'mode': 'ERROR'
+        }
+
+
 def main() -> None:
     """Main trading bot function"""
     # Load configuration
@@ -103,8 +155,13 @@ def main() -> None:
     def signal_handler(signum, frame):
         """Handle shutdown signals gracefully"""
         logger.info(f"Received signal {signum}, shutting down gracefully...")
-        if trader and hasattr(trader, 'shutdown'):
-            trader.shutdown()
+        if trader:
+            if hasattr(trader, 'shutdown'):
+                trader.shutdown()
+            elif hasattr(trader, 'cleanup'):
+                # IBKR trader uses cleanup method
+                import asyncio
+                asyncio.run(trader.cleanup())
         sys.exit(0)
     
     # Register signal handlers
@@ -138,8 +195,13 @@ def main() -> None:
         from framework.execution.ccxt.ccxt_trader import CCXTTrader
         trader = CCXTTrader(config)
         logger.warning("*** USING LIVE TRADING WITH REAL MONEY ***")
+    elif config.broker == "ibkr":
+        # Interactive Brokers trading (LIVE - requires IBKR account)
+        from framework.execution.ibkr.ibkr_trader import IBKRTrader
+        trader = IBKRTrader(config)
+        logger.warning("*** USING IBKR TRADING - REAL MONEY AT RISK ***")
     else:
-        raise ValueError(f"Unknown broker: {config.broker}. Use 'paper_ccxt' or 'ccxt'")
+        raise ValueError(f"Unknown broker: {config.broker}. Use 'paper_ccxt', 'ccxt', or 'ibkr'")
 
     logger.info(f"Using strategy: {strategy.__class__.__name__}")
 
@@ -147,18 +209,33 @@ def main() -> None:
     data_source = "SANDBOX" if config.use_sandbox else "LIVE DATA"
     if config.broker == "paper_ccxt":
         logger.warning(f"Starting PAPER TRADING with {data_source} - Virtual money only!")
+    elif config.broker == "ibkr":
+        account_type = os.getenv('IBKR_ACCOUNT_TYPE', 'paper').upper()
+        logger.warning(f"Starting IBKR {account_type} TRADING - REAL MONEY AT RISK!")
     else:
         logger.warning(f"Starting LIVE TRADING with {data_source} - REAL MONEY AT RISK!")
+
+    # Initialize trader if IBKR
+    if config.broker == "ibkr":
+        import asyncio
+        if not asyncio.run(trader.initialize()):
+            logger.error("Failed to initialize IBKR trader")
+            return
 
     # Main trading loop
     while True:
         try:
             # Process each symbol using the proven trading cycle
-            for symbol in config.symbols:
-                trader.run_trading_cycle(symbol, strategy)
+            if config.broker == "ibkr":
+                # IBKR uses async operations
+                asyncio.run(run_ibkr_trading_cycle(trader, config.symbols, strategy))
+            else:
+                # CCXT traders use sync operations
+                for symbol in config.symbols:
+                    trader.run_trading_cycle(symbol, strategy)
 
             # Get performance summary
-            performance = trader.get_performance_summary()
+            performance = get_performance_summary(trader, config.broker)
             logger.info(
                 "Performance summary",
                 extra={
