@@ -87,57 +87,6 @@ class SimpleConfig:
         return params
 
 
-async def run_ibkr_trading_cycle(trader, symbols: list, strategy):
-    """Run IBKR trading cycle asynchronously"""
-    for symbol in symbols:
-        try:
-            # Get market data
-            df = await trader.get_market_data(symbol, trader.config.timeframe)
-            if df is None or len(df) < strategy.min_bars_required:
-                continue
-            
-            # Generate signals
-            signals = strategy.generate_signals(df)
-            if signals is None or len(signals) == 0:
-                continue
-            
-            latest_signal = signals['signal'].iloc[-1]
-            current_price = df['close'].iloc[-1]
-            
-            # Execute trade
-            await trader.execute_trade(symbol, latest_signal, current_price, strategy)
-            
-        except Exception as e:
-            trader.logger.error(f"Error in IBKR trading cycle for {symbol}: {e}")
-
-
-def get_performance_summary(trader, broker_type: str) -> dict:
-    """Get performance summary for any trader type"""
-    try:
-        if broker_type == "ibkr":
-            return {
-                'daily_pnl': trader.get_daily_pnl(),
-                'open_positions': len(trader.get_positions()),
-                'initial_balance': trader.get_balance(),
-                'current_balance': trader.get_balance() + trader.get_daily_pnl(),
-                'total_pnl': trader.get_daily_pnl(),
-                'emergency_stop': trader.is_emergency_stop(),
-                'mode': 'IBKR'
-            }
-        else:
-            # CCXT traders
-            return trader.get_performance_summary()
-    except Exception as e:
-        return {
-            'daily_pnl': 0,
-            'open_positions': 0, 
-            'initial_balance': 0,
-            'current_balance': 0,
-            'total_pnl': 0,
-            'emergency_stop': False,
-            'mode': 'ERROR'
-        }
-
 
 def main() -> None:
     """Main trading bot function"""
@@ -228,14 +177,15 @@ def main() -> None:
             # Process each symbol using the proven trading cycle
             if config.broker == "ibkr":
                 # IBKR uses async operations
-                asyncio.run(run_ibkr_trading_cycle(trader, config.symbols, strategy))
+                for symbol in config.symbols:
+                    asyncio.run(trader.run_trading_cycle(symbol, strategy))
             else:
                 # CCXT traders use sync operations
                 for symbol in config.symbols:
                     trader.run_trading_cycle(symbol, strategy)
 
             # Get performance summary
-            performance = get_performance_summary(trader, config.broker)
+            performance = trader.get_performance_summary()
             logger.info(
                 "Performance summary",
                 extra={

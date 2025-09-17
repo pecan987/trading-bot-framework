@@ -49,7 +49,10 @@ class IBKRTrader:
     def __init__(self, config):
         """Initialize IBKR trader with configuration"""
         self.config = config
-        self.logger = get_logger(f"{__name__}.{config.exchange_name}")
+        
+        # Use "ibkr" as exchange name for IBKR trading
+        exchange_name = "ibkr"
+        self.logger = get_logger(f"{__name__}.{exchange_name}")
         
         # IBKR-specific configuration
         self.ibkr_config = IBKRConfig.from_env()
@@ -59,7 +62,7 @@ class IBKRTrader:
         self.ib = self.connection.ib
         
         # State management
-        self.state_store = SimpleStateStore(f"ibkr_{config.exchange_name}_{config.timeframe}")
+        self.state_store = SimpleStateStore(f"ibkr_{exchange_name}_{config.timeframe}")
         self.positions = {}
         self.orders = {}
         
@@ -567,3 +570,63 @@ class IBKRTrader:
     def is_emergency_stop(self) -> bool:
         """Check if emergency stop is active"""
         return self.emergency_stop
+    
+    async def run_trading_cycle(self, symbol: str, strategy) -> bool:
+        """
+        Run one trading cycle for a symbol (compatibility method for main.py)
+        
+        Args:
+            symbol: Trading symbol
+            strategy: Strategy instance
+            
+        Returns:
+            bool: True if cycle completed successfully
+        """
+        try:
+            if self.emergency_stop:
+                return False
+            
+            # Get market data
+            df = await self.get_market_data(symbol, self.config.timeframe)
+            if df is None or len(df) < strategy.min_bars_required:
+                self.logger.warning(f"Insufficient data for {symbol}")
+                return False
+            
+            # Generate signals
+            signals = strategy.generate_signals(df)
+            if signals is None or len(signals) == 0:
+                return False
+            
+            latest_signal = signals['signal'].iloc[-1]
+            current_price = df['close'].iloc[-1]
+            
+            # Execute trade
+            return await self.execute_trade(symbol, latest_signal, current_price, strategy)
+            
+        except Exception as e:
+            self.logger.error(f"Error in trading cycle for {symbol}: {e}")
+            return False
+    
+    def get_performance_summary(self) -> dict:
+        """Get performance summary (compatibility method for main.py)"""
+        try:
+            return {
+                'daily_pnl': self.get_daily_pnl(),
+                'open_positions': len(self.get_positions()),
+                'initial_balance': self.get_balance(),
+                'current_balance': self.get_balance() + self.get_daily_pnl(),
+                'total_pnl': self.get_daily_pnl(),
+                'emergency_stop': self.is_emergency_stop(),
+                'mode': f'IBKR {self.ibkr_config.account_type.value.upper()}'
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting performance summary: {e}")
+            return {
+                'daily_pnl': 0,
+                'open_positions': 0,
+                'initial_balance': 0,
+                'current_balance': 0,
+                'total_pnl': 0,
+                'emergency_stop': True,
+                'mode': 'IBKR ERROR'
+            }
