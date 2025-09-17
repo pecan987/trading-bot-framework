@@ -33,11 +33,12 @@ class TestStrategy(BaseStrategy):
         super().__init__("TEST", parameters)
         
         self.position_size = position_size
-        self.min_bars_required = 2  # Minimal requirement for compatibility
+        self.min_bars_required = 2  # Need at least 2 candles
+        self.last_signal = 0  # Track the last signal to alternate
         
     def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
         """
-        Generate alternating buy/sell signals every 2 candles.
+        Generate alternating signals: 0 -> 1 -> -1 -> 1 -> -1 -> ...
         
         Args:
             data: OHLCV DataFrame with DatetimeIndex
@@ -60,25 +61,27 @@ class TestStrategy(BaseStrategy):
         result['signal'] = 0
         result['position_size'] = 0.0
         
-        # Generate alternating pattern every 2 candles
-        for i in range(len(data)):
-            cycle_position = i % 4  # 4-candle cycle
-            
-            if cycle_position in [0, 1]:
-                # First 2 candles: Buy signal
-                result.iloc[i, result.columns.get_loc('signal')] = 1
-                result.iloc[i, result.columns.get_loc('position_size')] = self.position_size
-            elif cycle_position in [2, 3]:
-                # Next 2 candles: Sell signal  
-                result.iloc[i, result.columns.get_loc('signal')] = -1
-                result.iloc[i, result.columns.get_loc('position_size')] = self.position_size
+        # Generate next signal based on last signal
+        if self.last_signal == 0:
+            new_signal = 1  # 0 -> 1 (buy)
+        elif self.last_signal == 1:
+            new_signal = -1  # 1 -> -1 (sell) 
+        else:  # self.last_signal == -1
+            new_signal = 1  # -1 -> 1 (buy)
+        
+        # Set signal for all rows (we only care about the last one)
+        result['signal'] = new_signal
+        result['position_size'] = self.position_size
+        
+        # Update last signal for next call
+        self.last_signal = new_signal
         
         return result[['signal', 'position_size']]
     
     def get_description(self) -> str:
         """Return strategy description."""
         return (
-            f"Test Strategy - Alternates buy/sell every 2 candles "
+            f"Test Strategy - Alternates signals: 0→1→-1→1→-1... "
             f"(position_size: {self.position_size})"
         )
     

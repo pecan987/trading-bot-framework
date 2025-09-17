@@ -18,6 +18,9 @@ from framework.utils.latency_monitor import measure_api_latency
 # from framework.utils.sync_db_logger import get_sync_db_logger  # Disabled for now
 from framework.utils.logger import get_logger
 from framework.monitoring.alert_system import AlertSystem
+from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
+from framework.risk.fixed_risk_manager import FixedRiskManager
+from framework.risk.strategy_position_size_manager import StrategyPositionSizeManager
 
 
 class OrderStatus(Enum):
@@ -82,13 +85,14 @@ class CCXTTrader:
         self.daily_pnl = 0.0
         self.initial_balance = None
         
-        # Position sizing settings
-        self.balance_percentage = 0.1  # 10% of balance per trade
-        self.risk_percentage = 0.02    # 2% risk per trade
+        # Legacy position sizing setting (now handled by risk manager)
         self.max_position_pct = config.max_position_size
         
         # Alert system
         self.alert_system = AlertSystem(config)
+        
+        # Initialize risk manager
+        self.risk_manager = self._initialize_risk_manager(config)
         
         # Database logger
         try:
@@ -151,6 +155,34 @@ class CCXTTrader:
         """Cleanup on destruction"""
         if hasattr(self, 'state_store') and hasattr(self, 'lock_id'):
             self.state_store.release_lock(self.lock_id)
+    
+    def _initialize_risk_manager(self, config):
+        """Initialize risk manager based on configuration"""
+        risk_manager_type = getattr(config, 'risk_manager_type', 'fixed_position')
+        risk_manager_params = getattr(config, 'risk_manager_params', {})
+        
+        if risk_manager_type == "fixed_position":
+            risk_manager = FixedPositionSizeManager(
+                position_size=risk_manager_params.get('position_size', 0.1)
+            )
+        elif risk_manager_type == "fixed_risk":
+            risk_manager = FixedRiskManager(
+                risk_percent=risk_manager_params.get('risk_percent', 0.01),
+                default_stop_distance=risk_manager_params.get('default_stop_distance', 0.02)
+            )
+        elif risk_manager_type == "strategy_position":
+            risk_manager = StrategyPositionSizeManager(
+                max_position_size=risk_manager_params.get('max_position_size', 1.0),
+                min_position_size=risk_manager_params.get('min_position_size', 0.001),
+                apply_safety_limits=risk_manager_params.get('apply_safety_limits', True)
+            )
+        else:
+            # Default to fixed position size
+            self.logger.warning(f"Unknown risk manager type: {risk_manager_type}, using fixed_position")
+            risk_manager = FixedPositionSizeManager(position_size=0.1)
+        
+        self.logger.info(f"Risk Manager: {risk_manager.get_description()}")
+        return risk_manager
             
     def _initialize_exchange(self):
         """Initialize exchange with comprehensive error handling"""
@@ -321,7 +353,7 @@ class CCXTTrader:
             if abs(self.daily_pnl) > self.daily_loss_limit:
                 self.logger.error(f"Daily loss limit reached: {self.daily_pnl}")
                 self.emergency_stop = True
-                alert_message = f"🚨 EMERGENCY STOP: Daily loss limit reached!\nDaily P&L: {self.daily_pnl:.2f} USDT\nLimit: {self.daily_loss_limit:.2f} USDT\nTrading halted."
+                alert_message = f"*** EMERGENCY STOP: Daily loss limit reached!\nDaily P&L: {self.daily_pnl:.2f} USDT\nLimit: {self.daily_loss_limit:.2f} USDT\nTrading halted."
                 self.alert_system.send_alert(alert_message, "error")
                 return
                 
@@ -333,7 +365,7 @@ class CCXTTrader:
                 
             # Generate signals
             signals = strategy.generate_signals(df)
-            latest_signal = signals.iloc[-1]
+            latest_signal = signals['signal'].iloc[-1]  # Extract just the signal value
 
             self.logger.info("Latest signal", extra={'signal': latest_signal})
             
@@ -469,7 +501,7 @@ class CCXTTrader:
     def _determine_action(self, position: dict, signal: float, current_price: float, strategy) -> dict:
         """Determine what action to take based on position and signal"""
         position_size = position.get('size', 0)
-        strategy_name = strategy.get_strategy_name()
+        strategy_name = self.config.strategy_name
         
         # Debug logging at the start
         self.logger.debug(
@@ -581,14 +613,17 @@ class CCXTTrader:
             self.logger.warning(f"Could not get balance, using fallback: {e}")
             available_balance = self.config.initial_capital * 0.1  # Conservative fallback
             
-        # Simple position sizing - use percentage of balance
-        position_value = available_balance * self.balance_percentage
-        position_size = position_value / current_price
+        # Use risk manager for position sizing
+        signal = 1  # For position sizing calculation
+        position_size_ratio = self.risk_manager.calculate_position_size(
+            signal=signal,
+            current_price=current_price,
+            equity=available_balance
+        )
         
-        # Apply strategy-specific sizing if available
-        if hasattr(strategy, 'get_position_size'):
-            strategy_size = strategy.get_position_size(None, 1, available_balance)
-            position_size = min(position_size, strategy_size / current_price)
+        # Convert ratio to actual quantity
+        position_value = available_balance * position_size_ratio
+        position_size = position_value / current_price
             
         return position_size
         
@@ -647,7 +682,7 @@ class CCXTTrader:
                             price=exchange_order.get('price', current_price),
                             status='pending',
                             order_type='market',
-                            strategy_name=strategy.get_strategy_name(),
+                            strategy_name=self.config.strategy_name,
                             exchange=self.config.exchange_name,
                             metadata={
                                 'internal_order_id': order_id,
@@ -684,7 +719,7 @@ class CCXTTrader:
                                 price=filled_order.get('average', current_price),
                                 status='filled',
                                 order_type='market',
-                                strategy_name=strategy.get_strategy_name(),
+                                strategy_name=self.config.strategy_name,
                                 exchange=self.config.exchange_name,
                                 commission=commission,
                                 commission_asset=commission_asset,
@@ -852,8 +887,8 @@ class CCXTTrader:
                 self.logger.info(f"Position closed: P&L = {net_pnl:.2f} USDT")
                 
                 # Send position close alert
-                pnl_emoji = "💰" if net_pnl > 0 else "📉"
-                alert_message = f"{pnl_emoji} Position Closed: {symbol}\nSize: {filled_size:.6f}\nClose Price: ${average_price:.2f}\nP&L: {net_pnl:.2f} USDT\nDaily P&L: {self.daily_pnl:.2f} USDT"
+                pnl_indicator = "PROFIT" if net_pnl > 0 else "LOSS"
+                alert_message = f"Position Closed ({pnl_indicator}): {symbol}\nSize: {filled_size:.6f}\nClose Price: ${average_price:.2f}\nP&L: {net_pnl:.2f} USDT\nDaily P&L: {self.daily_pnl:.2f} USDT"
                 alert_level = "info" if net_pnl > 0 else "warning" if net_pnl > -100 else "error"
                 self.alert_system.send_alert(alert_message, alert_level)
                 
@@ -888,7 +923,7 @@ class CCXTTrader:
                     'positions_count': len(self.positions),
                     'orders_count': len(self.orders),
                     'daily_pnl': self.daily_pnl,
-                    'storage_backend': self.state_store.get_storage_info().get('primary_store')
+                    'storage_backend': getattr(self.state_store, 'get_storage_info', lambda: {'primary_store': 'SimpleFileStore'})().get('primary_store')
                 }
             )
             
@@ -909,7 +944,7 @@ class CCXTTrader:
             self.logger.debug(
                 "State saved successfully",
                 extra={
-                    'storage_backend': self.state_store.get_storage_info().get('primary_store')
+                    'storage_backend': getattr(self.state_store, 'get_storage_info', lambda: {'primary_store': 'SimpleFileStore'})().get('primary_store')
                 }
             )
             
@@ -919,7 +954,7 @@ class CCXTTrader:
                 extra={
                     'error': str(e),
                     'error_type': type(e).__name__,
-                    'storage_backend': self.state_store.get_storage_info().get('primary_store')
+                    'storage_backend': getattr(self.state_store, 'get_storage_info', lambda: {'primary_store': 'SimpleFileStore'})().get('primary_store')
                 }
             )
             

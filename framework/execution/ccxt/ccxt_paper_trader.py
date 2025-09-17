@@ -14,6 +14,9 @@ from framework.utils.simple_state_store import SimpleStateStore
 from framework.utils.latency_monitor import measure_api_latency
 from framework.utils.logger import get_logger
 from framework.monitoring.alert_system import AlertSystem
+from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
+from framework.risk.fixed_risk_manager import FixedRiskManager
+from framework.risk.strategy_position_size_manager import StrategyPositionSizeManager
 
 
 class OrderStatus(Enum):
@@ -72,9 +75,7 @@ class CCXTPaperTrader:
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
         
-        # Position sizing settings
-        self.balance_percentage = 0.1  # 10% of balance per trade
-        self.risk_percentage = 0.02    # 2% risk per trade
+        # Legacy position sizing setting (now handled by risk manager)
         self.max_position_pct = config.max_position_size
         
         # Alert system
@@ -87,6 +88,9 @@ class CCXTPaperTrader:
         # Commission and slippage simulation
         self.commission_rate = getattr(config, 'commission', 0.001)
         self.slippage_rate = getattr(config, 'slippage', 0.0005)
+        
+        # Initialize risk manager
+        self.risk_manager = self._initialize_risk_manager(config)
         
         # Try to acquire lock
         lock_id = f"paper_trader_{config.exchange_name}_{config.timeframe}_{date.today().isoformat()}"
@@ -101,6 +105,34 @@ class CCXTPaperTrader:
         self._load_state()
         
         self.logger.info(f"Paper trader initialized with ${self.initial_balance:.2f} virtual capital")
+    
+    def _initialize_risk_manager(self, config):
+        """Initialize risk manager based on configuration"""
+        risk_manager_type = getattr(config, 'risk_manager_type', 'fixed_position')
+        risk_manager_params = getattr(config, 'risk_manager_params', {})
+        
+        if risk_manager_type == "fixed_position":
+            risk_manager = FixedPositionSizeManager(
+                position_size=risk_manager_params.get('position_size', 0.1)
+            )
+        elif risk_manager_type == "fixed_risk":
+            risk_manager = FixedRiskManager(
+                risk_percent=risk_manager_params.get('risk_percent', 0.01),
+                default_stop_distance=risk_manager_params.get('default_stop_distance', 0.02)
+            )
+        elif risk_manager_type == "strategy_position":
+            risk_manager = StrategyPositionSizeManager(
+                max_position_size=risk_manager_params.get('max_position_size', 1.0),
+                min_position_size=risk_manager_params.get('min_position_size', 0.001),
+                apply_safety_limits=risk_manager_params.get('apply_safety_limits', True)
+            )
+        else:
+            # Default to fixed position size
+            self.logger.warning(f"Unknown risk manager type: {risk_manager_type}, using fixed_position")
+            risk_manager = FixedPositionSizeManager(position_size=0.1)
+        
+        self.logger.info(f"Risk Manager: {risk_manager.get_description()}")
+        return risk_manager
     
     def _initialize_exchange(self):
         """Initialize CCXT exchange for market data (no API keys needed)"""
@@ -214,12 +246,13 @@ class CCXTPaperTrader:
                 self.logger.error(f"Daily loss limit reached: {self.daily_pnl}")
                 self.emergency_stop = True
                 if self.alert_system:
-                    alert_message = f"🚨 EMERGENCY STOP: Daily loss limit reached!\nDaily P&L: {self.daily_pnl:.2f} USDT\nLimit: {self.daily_loss_limit:.2f} USDT\nTrading halted."
+                    alert_message = f"*** EMERGENCY STOP: Daily loss limit reached!\nDaily P&L: {self.daily_pnl:.2f} USDT\nLimit: {self.daily_loss_limit:.2f} USDT\nTrading halted."
                     self.alert_system.send_alert(alert_message, "error")
                 return
             
-            # Get market data
-            df = self.get_market_data(symbol, self.config.timeframe, 100)
+            # Get market data - use strategy's minimum requirement for deterministic behavior
+            bars_needed = max(strategy.min_bars_required, 20)  # At least 20 for context
+            df = self.get_market_data(symbol, self.config.timeframe, bars_needed)
             if df is None or len(df) < strategy.min_bars_required:
                 self.logger.warning(f"Insufficient data for {symbol}")
                 return
@@ -277,8 +310,16 @@ class CCXTPaperTrader:
     
     def _simulate_buy(self, symbol: str, price: float):
         """Simulate buying a position"""
-        # Calculate position size
-        position_value = self.current_balance * self.balance_percentage
+        # Calculate position size using risk manager
+        total_equity = self.current_balance + self.unrealized_pnl
+        position_size_ratio = self.risk_manager.calculate_position_size(
+            signal=1,
+            current_price=price,
+            equity=total_equity
+        )
+        
+        # Convert ratio to actual quantity
+        position_value = total_equity * position_size_ratio
         quantity = position_value / price
         
         # Apply slippage
@@ -304,7 +345,7 @@ class CCXTPaperTrader:
         
         # Log trade
         self.logger.info(
-            f"🟢 PAPER BOUGHT {quantity:.6f} {symbol} @ ${execution_price:.2f} "
+            f"PAPER BOUGHT {quantity:.6f} {symbol} @ ${execution_price:.2f} "
             f"(Commission: ${commission:.2f})"
         )
         
@@ -344,15 +385,15 @@ class CCXTPaperTrader:
         self.positions[symbol] = {'size': 0, 'entry_price': None}
         
         # Log trade
-        pnl_emoji = "💰" if net_pnl > 0 else "📉"
+        pnl_indicator = "PROFIT" if net_pnl > 0 else "LOSS"
         self.logger.info(
-            f"🔴 PAPER SOLD {quantity:.6f} {symbol} @ ${execution_price:.2f} "
-            f"P&L: {pnl_emoji} ${net_pnl:.2f} (Commission: ${commission:.2f})"
+            f"PAPER SOLD {quantity:.6f} {symbol} @ ${execution_price:.2f} "
+            f"P&L: {pnl_indicator} ${net_pnl:.2f} (Commission: ${commission:.2f})"
         )
         
         # Send alert
         if self.alert_system:
-            alert_message = f"{pnl_emoji} Paper Position Closed: {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nBalance: ${self.current_balance:.2f}"
+            alert_message = f"Paper Position Closed ({pnl_indicator}): {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nBalance: ${self.current_balance:.2f}"
             alert_level = "info" if net_pnl > 0 else "warning"
             self.alert_system.send_alert(alert_message, alert_level)
     
@@ -362,8 +403,16 @@ class CCXTPaperTrader:
             self.logger.warning(f"Shorting not allowed for {symbol} in {self.trading_type} mode")
             return
             
-        # Calculate position size (negative for short)
-        position_value = self.current_balance * self.balance_percentage
+        # Calculate position size using risk manager
+        total_equity = self.current_balance + self.unrealized_pnl
+        position_size_ratio = self.risk_manager.calculate_position_size(
+            signal=-1,
+            current_price=price,
+            equity=total_equity
+        )
+        
+        # Convert ratio to actual quantity (negative for short)
+        position_value = total_equity * position_size_ratio
         quantity = -(position_value / price)  # Negative for short
         
         # Apply slippage (worse fill for short)
@@ -385,13 +434,13 @@ class CCXTPaperTrader:
         
         # Log trade
         self.logger.info(
-            f"🟠 PAPER SHORTED {abs(quantity):.6f} {symbol} @ ${execution_price:.2f} "
+            f"PAPER SHORTED {abs(quantity):.6f} {symbol} @ ${execution_price:.2f} "
             f"(Commission: ${commission:.2f})"
         )
         
         # Send alert
         if self.alert_system:
-            alert_message = f"🟠 Paper Short Opened: {symbol}\nSize: {abs(quantity):.6f}\nPrice: ${execution_price:.2f}\nBalance: ${self.current_balance:.2f}"
+            alert_message = f"Paper Short Opened: {symbol}\nSize: {abs(quantity):.6f}\nPrice: ${execution_price:.2f}\nBalance: ${self.current_balance:.2f}"
             self.alert_system.send_alert(alert_message, "info")
 
     def _simulate_buy_to_cover(self, symbol: str, price: float):
@@ -425,15 +474,15 @@ class CCXTPaperTrader:
         self.positions[symbol] = {'size': 0, 'entry_price': None}
         
         # Log trade
-        pnl_emoji = "💰" if net_pnl > 0 else "📉"
+        pnl_indicator = "PROFIT" if net_pnl > 0 else "LOSS"
         self.logger.info(
-            f"🟡 PAPER COVERED {quantity:.6f} {symbol} @ ${execution_price:.2f} "
-            f"P&L: {pnl_emoji} ${net_pnl:.2f} (Commission: ${commission:.2f})"
+            f"PAPER COVERED {quantity:.6f} {symbol} @ ${execution_price:.2f} "
+            f"P&L: {pnl_indicator} ${net_pnl:.2f} (Commission: ${commission:.2f})"
         )
         
         # Send alert
         if self.alert_system:
-            alert_message = f"{pnl_emoji} Paper Short Covered: {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nBalance: ${self.current_balance:.2f}"
+            alert_message = f"Paper Short Covered ({pnl_indicator}): {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nBalance: ${self.current_balance:.2f}"
             alert_level = "info" if net_pnl > 0 else "warning"
             self.alert_system.send_alert(alert_message, alert_level)
     

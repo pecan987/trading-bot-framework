@@ -51,9 +51,40 @@ class SimpleConfig:
         self.initial_capital = float(os.getenv('INITIAL_CAPITAL', '10000.0'))
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', '0.1'))
         
+        # Risk manager configuration
+        self.risk_manager_type = os.getenv('RISK_MANAGER_TYPE', 'fixed_position')
+        self.risk_manager_params = self._parse_risk_manager_params()
+        
+        # Stop loss configuration
+        self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.05'))  # 5% default stop loss
+        
         # Logging
         self.log_level = os.getenv('LOG_LEVEL', 'INFO')
         self.use_json_logs = os.getenv('USE_JSON_LOGS', 'false').lower() == 'true'
+    
+    def _parse_risk_manager_params(self):
+        """Parse risk manager parameters from environment variables"""
+        params = {}
+        
+        # Parameters for FixedPositionSizeManager
+        if os.getenv('RISK_POSITION_SIZE'):
+            params['position_size'] = float(os.getenv('RISK_POSITION_SIZE'))
+        
+        # Parameters for FixedRiskManager
+        if os.getenv('RISK_PERCENT'):
+            params['risk_percent'] = float(os.getenv('RISK_PERCENT'))
+        if os.getenv('RISK_DEFAULT_STOP_DISTANCE'):
+            params['default_stop_distance'] = float(os.getenv('RISK_DEFAULT_STOP_DISTANCE'))
+        
+        # Parameters for StrategyPositionSizeManager
+        if os.getenv('RISK_MAX_POSITION_SIZE'):
+            params['max_position_size'] = float(os.getenv('RISK_MAX_POSITION_SIZE'))
+        if os.getenv('RISK_MIN_POSITION_SIZE'):
+            params['min_position_size'] = float(os.getenv('RISK_MIN_POSITION_SIZE'))
+        if os.getenv('RISK_APPLY_SAFETY_LIMITS'):
+            params['apply_safety_limits'] = os.getenv('RISK_APPLY_SAFETY_LIMITS').lower() == 'true'
+        
+        return params
 
 
 def main() -> None:
@@ -106,7 +137,7 @@ def main() -> None:
         # Live trading with real money (DANGEROUS)
         from framework.execution.ccxt.ccxt_trader import CCXTTrader
         trader = CCXTTrader(config)
-        logger.warning("🚨 USING LIVE TRADING WITH REAL MONEY 🚨")
+        logger.warning("*** USING LIVE TRADING WITH REAL MONEY ***")
     else:
         raise ValueError(f"Unknown broker: {config.broker}. Use 'paper_ccxt' or 'ccxt'")
 
@@ -151,7 +182,7 @@ def main() -> None:
             sleep_time = timeframe_seconds - (time.time() % timeframe_seconds)
 
             if sleep_time > 5:
-                logger.info(f"💤 Sleeping {sleep_time:.0f}s until next {config.timeframe} candle...")
+                logger.info(f"Sleeping {sleep_time:.0f}s until next {config.timeframe} candle...")
                 time.sleep(sleep_time)
             else:
                 # If too close to next candle, wait for the one after
