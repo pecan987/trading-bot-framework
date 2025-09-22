@@ -11,11 +11,11 @@ from enum import Enum
 from dataclasses import dataclass, asdict
 
 from .state_persistence import StateStore
+from framework.utils.postgres_state_store import PostgreSQLStateStore
 from framework.utils.simple_state_store import SimpleStateStore
 from .position_sync import PositionSynchronizer
 from .data_manager import DataManager
 from framework.utils.latency_monitor import measure_api_latency
-# from framework.utils.sync_db_logger import get_sync_db_logger  # Disabled for now
 from framework.utils.logger import get_logger
 from framework.monitoring.alert_system import AlertSystem
 from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
@@ -62,13 +62,27 @@ class CCXTTrader:
                 'initial_capital': self.config.initial_capital
             }
         )
-        self.state_store = SimpleStateStore(exchange=self.config.exchange_name.upper())
+        
+        # Try PostgreSQL first, fallback to file storage
+        try:
+            self.state_store = PostgreSQLStateStore(
+                exchange=self.config.exchange_name.upper(),
+                instance_id=f"trader_{self.config.exchange_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            storage_type = 'PostgreSQL'
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to initialize PostgreSQL state store: {e}, falling back to file storage",
+                extra={'error': str(e)}
+            )
+            self.state_store = SimpleStateStore(exchange=self.config.exchange_name.upper())
+            storage_type = 'SimpleFileStore'
         
         # Log state store info
         self.logger.info(
             "State store initialized",
             extra={
-                'storage_type': 'SimpleFileStore',
+                'storage_type': storage_type,
                 'exchange': self.config.exchange_name.upper()
             }
         )
@@ -95,32 +109,13 @@ class CCXTTrader:
         self.risk_manager = self._initialize_risk_manager(config)
         
         # Database logger
+        from framework.utils.async_db_logger import get_db_logger
         try:
-            self.logger.info(
-                "Initializing database logger...",
-                extra={
-                    'exchange': self.config.exchange_name,
-                    'use_sandbox': self.config.use_sandbox
-                }
-            )
-            # self.db_logger = get_sync_db_logger()  # Disabled for now
-            self.db_logger = None
-            self.db_logging_enabled = False
-            self.logger.info(
-                "Database logging disabled for now",
-                extra={
-                    'exchange': self.config.exchange_name
-                }
-            )
+            self.db_logger = get_db_logger()
+            self.db_logging_enabled = True
+            self.logger.info("Database logging enabled")
         except Exception as e:
-            self.logger.warning(
-                "Database logging disabled",
-                extra={
-                    'error': str(e),
-                    'error_type': type(e).__name__,
-                    'exchange': self.config.exchange_name
-                }
-            )
+            self.logger.warning(f"Failed to initialize database logger: {e}")
             self.db_logger = None
             self.db_logging_enabled = False
         
@@ -150,6 +145,9 @@ class CCXTTrader:
         
         # Recovery
         self._recover_state()
+        
+        # Note: Database logging is available in async_db_logger.py but disabled
+        # to avoid complexity. State persistence works via trading.trading_state table.
         
     def __del__(self):
         """Cleanup on destruction"""
@@ -183,6 +181,43 @@ class CCXTTrader:
         
         self.logger.info(f"Risk Manager: {risk_manager.get_description()}")
         return risk_manager
+    
+    def _initialize_async_db_logger(self):
+        """Initialize async database logger in background"""
+        async def init_db_logger():
+            try:
+                self.logger.info("Initializing async database logger...")
+                self.db_logger = await get_async_db_logger()
+                self.db_logging_enabled = True
+                self.logger.info("Async database logging enabled")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize async database logger: {e}")
+                self.db_logger = None
+                self.db_logging_enabled = False
+        
+        # Start initialization in background
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            self._db_logger_task = loop.create_task(init_db_logger())
+        except RuntimeError:
+            # No event loop running, database logging will be disabled
+            self.logger.warning("No event loop available for async database logging")
+            self.db_logger = None
+            self.db_logging_enabled = False
+    
+    def _log_to_db_async(self, coro):
+        """Helper to execute database logging coroutines"""
+        if not self.db_logging_enabled or not self.db_logger:
+            return
+            
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            # Fire and forget - don't wait for completion
+            loop.create_task(coro)
+        except Exception as e:
+            self.logger.debug(f"Failed to schedule database logging: {e}")
             
     def _initialize_exchange(self):
         """Initialize exchange with comprehensive error handling"""
@@ -719,15 +754,15 @@ class CCXTTrader:
                                 price=filled_order.get('average', current_price),
                                 status='filled',
                                 order_type='market',
-                                strategy_name=self.config.strategy_name,
-                                exchange=self.config.exchange_name,
-                                commission=commission,
-                                commission_asset=commission_asset,
+                                strategy=getattr(self.config, 'strategy_name', None),
+                                fee=commission,
+                                fee_currency=commission_asset,
                                 executed_at=datetime.now(),
                                 metadata={
                                     'internal_order_id': order_id,
                                     'action': action,
-                                    'filled_order': filled_order
+                                    'filled_order': filled_order,
+                                    'exchange': self.config.exchange_name
                                 }
                             )
                             
@@ -857,11 +892,13 @@ class CCXTTrader:
                     self.db_logger.update_position(
                         symbol=symbol,
                         quantity=position_size,
-                        average_price=average_price,
-                        exchange=self.config.exchange_name,
+                        entry_price=average_price,
+                        side='long' if 'long' in action_type else 'short',
+                        strategy=getattr(self.config, 'strategy_name', None),
                         metadata={
                             'action_type': action_type,
-                            'entry_time': datetime.now().isoformat()
+                            'entry_time': datetime.now().isoformat(),
+                            'exchange': self.config.exchange_name
                         }
                     )
                 except Exception as e:
@@ -901,14 +938,15 @@ class CCXTTrader:
                     self.db_logger.update_position(
                         symbol=symbol,
                         quantity=0,
-                        average_price=current_position.get('entry_price', average_price),
-                        exchange=self.config.exchange_name,
-                        realized_pnl=net_pnl if 'net_pnl' in locals() else 0,
+                        entry_price=current_position.get('entry_price', average_price),
+                        side=current_position.get('side', 'long'),
+                        strategy=getattr(self.config, 'strategy_name', None),
                         metadata={
                             'action_type': action_type,
                             'close_time': datetime.now().isoformat(),
                             'close_price': average_price,
-                            'pnl': net_pnl if 'net_pnl' in locals() else 0
+                            'pnl': net_pnl if 'net_pnl' in locals() else 0,
+                            'exchange': self.config.exchange_name
                         }
                     )
                 except Exception as e:
@@ -995,12 +1033,13 @@ class CCXTTrader:
                         'usdt_total': usdt_balance.get('total', 0)
                     }
                 )
-                self.db_logger.update_balance(
+                self.db_logger.log_balance(
                     account_id=self.config.exchange_name,
-                    asset='USDT',
+                    total_balance=usdt_balance.get('total', 0),
                     free_balance=usdt_balance.get('free', 0),
-                    locked_balance=usdt_balance.get('used', 0),
-                    exchange=self.config.exchange_name
+                    used_balance=usdt_balance.get('used', 0),
+                    currency='USDT',
+                    metadata={'exchange': self.config.exchange_name}
                 )
             
             # Update other significant balances
@@ -1015,12 +1054,13 @@ class CCXTTrader:
                             'total': balance.get('total', 0)
                         }
                     )
-                    self.db_logger.update_balance(
+                    self.db_logger.log_balance(
                         account_id=self.config.exchange_name,
-                        asset=asset,
+                        total_balance=balance.get('total', 0),
                         free_balance=balance.get('free', 0),
-                        locked_balance=balance.get('used', 0),
-                        exchange=self.config.exchange_name
+                        used_balance=balance.get('used', 0),
+                        currency=asset,
+                        metadata={'exchange': self.config.exchange_name}
                     )
                     
         except Exception as e:

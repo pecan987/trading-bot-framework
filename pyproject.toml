@@ -39,7 +39,10 @@ dependencies = [
     # Live trading dependencies
     "python-dotenv",
     "psycopg2-binary", # PostgreSQL adapter
+    "asyncpg>=0.29.0", # Async PostgreSQL adapter for database logging
     "ib-async>=0.9.86", # Interactive Brokers API
+    # Monitoring dependencies
+    "prometheus-client>=0.20.0", # Prometheus metrics
 ]
 
 [project.optional-dependencies]

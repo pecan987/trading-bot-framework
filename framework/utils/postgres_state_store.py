@@ -17,7 +17,7 @@ class DatabaseConfig:
     """Database configuration"""
     host: str = 'postgres'
     port: int = 5432
-    database: str = 'trading_bot'
+    database: str = 'trading'
     user: str = 'trading_user'
     password: str = 'trading_password'
     schema: str = 'trading'
@@ -28,7 +28,7 @@ class DatabaseConfig:
         return cls(
             host=os.getenv('DB_HOST', 'postgres'),
             port=int(os.getenv('DB_PORT', '5432')),
-            database=os.getenv('DB_NAME', 'trading_bot'),
+            database=os.getenv('DB_NAME', 'trading'),
             user=os.getenv('DB_USER', 'trading_user'),
             password=os.getenv('DB_PASSWORD', 'trading_password'),
             schema=os.getenv('DB_SCHEMA', 'trading')

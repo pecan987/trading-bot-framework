@@ -14,6 +14,7 @@ from framework.strategies.breakout_strategy import BreakoutStrategy
 from framework.strategies.fvg_strategy import FVGStrategy
 from framework.strategies.mean_reversion_strategy import MeanReversionStrategy
 from framework.strategies.test_strategy import TestStrategy
+from framework.utils.metrics_server import start_metrics_server, stop_metrics_server
 
 
 # Simple config class using environment variables
@@ -97,6 +98,13 @@ def main() -> None:
     from framework.utils.logger import setup_logger
     logger = setup_logger(config.log_level)
     logger.info("Starting trading bot...")
+    
+    # Start metrics server for Prometheus
+    metrics_port = int(os.getenv('METRICS_PORT', '8000'))
+    if start_metrics_server(port=metrics_port):
+        logger.info(f"Metrics server started on port {metrics_port}")
+    else:
+        logger.warning("Failed to start metrics server")
     
     # Global trader reference for signal handler
     trader = None
@@ -217,6 +225,7 @@ def main() -> None:
 
         except KeyboardInterrupt:
             logger.info("Shutting down...")
+            stop_metrics_server()
             break
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)

@@ -12,6 +12,7 @@ import pandas as pd
 
 from ib_async import IB, Stock, Forex, MarketOrder, LimitOrder, Order, Trade, Position, AccountValue
 from framework.utils.logger import get_logger
+from framework.utils.postgres_state_store import PostgreSQLStateStore
 from framework.utils.simple_state_store import SimpleStateStore
 from framework.monitoring.alert_system import AlertSystem
 from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
@@ -61,8 +62,16 @@ class IBKRTrader:
         self.connection = IBKRConnectionManager(self.ibkr_config)
         self.ib = self.connection.ib
         
-        # State management
-        self.state_store = SimpleStateStore(f"ibkr_{exchange_name}_{config.timeframe}")
+        # State management - Try PostgreSQL first, fallback to file storage
+        try:
+            self.state_store = PostgreSQLStateStore(
+                exchange=f"ibkr_{exchange_name}",
+                instance_id=f"ibkr_{exchange_name}_{config.timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            self.logger.info("Using PostgreSQL state store")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize PostgreSQL state store: {e}, using file storage")
+            self.state_store = SimpleStateStore(f"ibkr_{exchange_name}_{config.timeframe}")
         self.positions = {}
         self.orders = {}
         
@@ -83,6 +92,17 @@ class IBKRTrader:
         # Order tracking
         self.pending_orders = {}
         self.order_counter = 0
+        
+        # Database logger
+        from framework.utils.async_db_logger import get_db_logger
+        try:
+            self.db_logger = get_db_logger()
+            self.db_logging_enabled = True
+            self.logger.info("Database logging enabled")
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize database logger: {e}")
+            self.db_logger = None
+            self.db_logging_enabled = False
         
         self.logger.info(f"IBKR trader initialized: {self.ibkr_config}")
         self.logger.info(f"Risk Manager: {self.risk_manager.get_description()}")
@@ -538,6 +558,81 @@ class IBKRTrader:
                 del self.pending_orders[order_id]
                 
                 self.logger.info(f"Order filled: {order_info['action']} {filled_qty} {symbol} @ ${avg_price:.2f}")
+                
+                # Database logging
+                if self.db_logging_enabled:
+                    try:
+                        # Generate unique trade ID
+                        trade_id = f"ibkr_{symbol}_{int(trade.order.orderId)}_{int(time.time())}"
+                        
+                        # Log trade
+                        self.db_logger.log_trade(
+                            trade_id=trade_id,
+                            symbol=symbol,
+                            side='buy' if order_info['action'] == 'buy' else 'sell',
+                            quantity=filled_qty,
+                            price=avg_price,
+                            status='filled',
+                            order_type='market',
+                            strategy=getattr(self.config, 'strategy_name', None),
+                            fee=0,  # IBKR fees are calculated separately
+                            fee_currency='USD',
+                            executed_at=datetime.now(),
+                            metadata={
+                                'ibkr_order_id': trade.order.orderId,
+                                'action': order_info['action'],
+                                'reason': order_info.get('reason', ''),
+                                'exchange': 'ibkr'
+                            }
+                        )
+                        
+                        # Log position update
+                        if abs(new_size) < 0.001:  # Position closed
+                            self.db_logger.update_position(
+                                symbol=symbol,
+                                quantity=0,
+                                entry_price=self.positions[symbol].get('entry_price', avg_price),
+                                side='long' if old_size > 0 else 'short',
+                                strategy=getattr(self.config, 'strategy_name', None),
+                                metadata={
+                                    'close_time': datetime.now().isoformat(),
+                                    'close_price': avg_price,
+                                    'pnl': pnl if 'pnl' in locals() else 0,
+                                    'exchange': 'ibkr'
+                                }
+                            )
+                        else:  # Position opened/modified
+                            self.db_logger.update_position(
+                                symbol=symbol,
+                                quantity=new_size,
+                                entry_price=avg_price if abs(old_size) < 0.001 else self.positions[symbol].get('entry_price', avg_price),
+                                side='long' if new_size > 0 else 'short',
+                                strategy=getattr(self.config, 'strategy_name', None),
+                                metadata={
+                                    'entry_time': datetime.now().isoformat() if abs(old_size) < 0.001 else None,
+                                    'exchange': 'ibkr'
+                                }
+                            )
+                        
+                        # Log balance (get current account value)
+                        account_values = self.ib.accountValues()
+                        total_value = 0
+                        for av in account_values:
+                            if av.tag == 'TotalCashValue' and av.currency == 'USD':
+                                total_value = float(av.value)
+                                break
+                        
+                        if total_value > 0:
+                            self.db_logger.log_balance(
+                                account_id=f"ibkr_{self.ibkr_config.account_id}",
+                                total_balance=total_value,
+                                free_balance=total_value,  # Simplified for now
+                                used_balance=0,
+                                currency='USD',
+                                metadata={'exchange': 'ibkr', 'account_type': self.ibkr_config.account_type.value}
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to log IBKR trade to database: {e}")
                 
             elif trade.orderStatus.status in ['Cancelled', 'ApiCancelled']:
                 self.logger.warning(f"Order cancelled: {order_id}")

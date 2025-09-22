@@ -8,28 +8,122 @@ services:
     env_file:
       - .env
     environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-trading}
+      - DB_USER=${DB_USER:-trading_user}
+      - DB_PASSWORD=${DB_PASSWORD:-trading_password}
       - IBKR_HOST=localhost
+      - METRICS_PORT=8000
+    ports:
+      - "8000:8000"  # Metrics endpoint
     volumes:
       - ./:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
 
-#  postgres:
-#    image: postgres:16-alpine
-#    container_name: trading_postgres
-#    restart: unless-stopped
-#    environment:
-#      POSTGRES_DB: ${DB_NAME:-trading}
-#      POSTGRES_USER: ${DB_USER:-trading_user}
-#      POSTGRES_PASSWORD: ${DB_PASSWORD:-trading_password}
-#    ports:
-#      - "${DB_PORT:-5432}:5432"
-#    volumes:
-#      - postgres_data:/var/lib/postgresql/data
-#      - ./db/init:/docker-entrypoint-initdb.d
-#    healthcheck:
-#      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trading_user} -d ${DB_NAME:-trading}"]
-#      interval: 10s
-#      timeout: 5s
-#      retries: 5
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-trading}
+      POSTGRES_USER: ${DB_USER:-trading_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-trading_password}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trading_user} -d ${DB_NAME:-trading}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading_prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    depends_on:
+      - postgres-exporter
+      - node-exporter
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: trading_postgres_exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${DB_USER:-trading_user}:${DB_PASSWORD:-trading_password}@postgres:5432/${DB_NAME:-trading}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: trading_node_exporter
+    restart: unless-stopped
+    command:
+      - '--path.rootfs=/host'
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: false
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+
+  adminer:
+    image: adminer:latest
+    container_name: trading_adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: pepa-linha
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  ib_gateway_data:
+  ib_gateway_logs:
 
 #  ib-gateway:
 #    image: ghcr.io/gnzsnz/ib-gateway:stable
@@ -64,7 +158,3 @@ services:
 #      # Persist IB Gateway settings and logs
 #      - ib_gateway_data:/opt/ibc
 #      - ib_gateway_logs:/root/Jts
-
-volumes:
-  ib_gateway_data:
-  ib_gateway_logs:
