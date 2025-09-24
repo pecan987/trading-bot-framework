@@ -114,11 +114,6 @@ class IBKRTrader:
             # Create contract
             contract = self.connection.create_contract(symbol)
             
-            # Qualify contract
-            if not self.connection.qualify_contract(contract):
-                self.logger.error(f"Failed to qualify contract for {symbol}")
-                return None
-            
             # Map timeframe to bar size
             bar_size_map = {
                 '1min': '1 min',
@@ -132,11 +127,13 @@ class IBKRTrader:
             
             bar_size = bar_size_map.get(timeframe, '15 mins')
             
-            # Calculate duration
-            if timeframe in ['1D', '4h']:
-                duration = f"{lookback} D"
+            # Calculate duration - use more conservative approach that matches test
+            if timeframe in ['1D']:
+                duration = f"{max(lookback, 30)} D"
+            elif timeframe in ['4h', '1h']:
+                duration = "1 D"  # Use fixed 1 day like in successful test
             else:
-                duration = f"{lookback * 2} H"  # Give some buffer
+                duration = f"{max(lookback * 4, 24)} H"  # Give more buffer for smaller timeframes
             
             # Request historical data
             self.logger.debug(f"Requesting {lookback} bars of {symbol} ({bar_size})")
@@ -191,7 +188,7 @@ class IBKRTrader:
                 return False
             
             # Get market data - request more bars to ensure we have enough
-            lookback_bars = max(100, strategy.min_bars_required)
+            lookback_bars = strategy.min_bars_required
             df = self.get_market_data(symbol, self.timeframe, lookback_bars)
             if df is None or len(df) < strategy.min_bars_required:
                 self.logger.warning(f"Insufficient data for {symbol}: got {len(df) if df is not None else 0}, need {strategy.min_bars_required}")
@@ -203,7 +200,16 @@ class IBKRTrader:
                 return False
             
             latest_signal = signals['signal'].iloc[-1]
-            current_price = df['close'].iloc[-1]
+            
+            # Get live price for better execution, fallback to historical close
+            contract = self.connection.create_contract(symbol)
+            live_price = self.connection.get_live_price(contract, timeout=5.0)
+            current_price = live_price if live_price else df['close'].iloc[-1]
+            
+            if live_price:
+                self.logger.debug(f"Using live price for {symbol}: ${live_price:.2f}")
+            else:
+                self.logger.debug(f"Using historical close for {symbol}: ${current_price:.2f}")
             
             # Extract SL/TP if provided by strategy
             stop_loss = None

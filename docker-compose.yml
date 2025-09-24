@@ -145,9 +145,6 @@ services:
       READ_ONLY_API: "no"
       BYPASS_WARNING: "yes"
       ALLOW_BLIND_TRADING: "yes"
-      
-      # Enable delayed market data (free)
-      DELAYED_MARKET_DATA: "yes"
 
       # Timezone
       TIME_ZONE: ${TZ:-America/New_York}

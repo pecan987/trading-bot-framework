@@ -190,16 +190,37 @@ class IBKRConnection:
             return []
         
         try:
+            self.logger.debug(f"Requesting historical data for {contract.symbol}: duration={duration}, bar_size={bar_size}")
             self.rate_limit()
+            
+            # Ensure contract is qualified first
+            qualified = self.ib.qualifyContracts(contract)
+            if not qualified:
+                self.logger.error(f"Failed to qualify contract for {contract.symbol}")
+                return []
+            
+            # Use the first qualified contract
+            qualified_contract = qualified[0]
+            self.logger.debug(f"Using qualified contract: {qualified_contract}")
+            
+            # Request historical data with timeout
             bars = self.ib.reqHistoricalData(
-                contract=contract,
+                contract=qualified_contract,
                 endDateTime='',
                 durationStr=duration,
                 barSizeSetting=bar_size,
                 whatToShow=what_to_show,
-                useRTH=True
+                useRTH=True,
+                timeout=30  # 30 second timeout
             )
+            
+            if bars:
+                self.logger.debug(f"Retrieved {len(bars)} historical bars for {contract.symbol}")
+            else:
+                self.logger.warning(f"No historical data returned for {contract.symbol}")
+            
             return bars
+            
         except Exception as e:
             self.logger.error(f"Failed to get historical data for {contract.symbol}: {e}")
             return []
@@ -241,6 +262,99 @@ class IBKRConnection:
         except Exception as e:
             self.logger.error(f"Failed to get open orders: {e}")
             return []
+    
+    def get_live_price(self, contract: Contract, timeout: float = 10.0) -> Optional[float]:
+        """Get live market price for a contract"""
+        if not self.connected:
+            self.logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            self.logger.debug(f"Requesting live market data for {contract.symbol}")
+            self.rate_limit()
+            
+            # Ensure contract is qualified first
+            qualified = self.ib.qualifyContracts(contract)
+            if not qualified:
+                self.logger.error(f"Failed to qualify contract for {contract.symbol}")
+                return None
+            
+            qualified_contract = qualified[0]
+            
+            # Request market data
+            ticker = self.ib.reqMktData(qualified_contract, '', False, False)
+            
+            # Wait for price data with timeout
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                self.ib.sleep(0.1)  # Small sleep to allow data to arrive
+                
+                # Check for valid price data
+                if ticker.last and ticker.last > 0:
+                    price = float(ticker.last)
+                    self.logger.debug(f"Got live price for {contract.symbol}: ${price}")
+                    # Cancel the market data subscription
+                    self.ib.cancelMktData(qualified_contract)
+                    return price
+                elif ticker.close and ticker.close > 0:
+                    # Fallback to close price if last is not available
+                    price = float(ticker.close)
+                    self.logger.debug(f"Got close price for {contract.symbol}: ${price}")
+                    self.ib.cancelMktData(qualified_contract)
+                    return price
+            
+            # Timeout reached, cancel subscription
+            self.ib.cancelMktData(qualified_contract)
+            self.logger.warning(f"Timeout waiting for live price data for {contract.symbol}")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get live price for {contract.symbol}: {e}")
+            return None
+    
+    def get_market_snapshot(self, contract: Contract) -> Optional[dict]:
+        """Get market snapshot with bid/ask/last prices"""
+        if not self.connected:
+            self.logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            self.logger.debug(f"Requesting market snapshot for {contract.symbol}")
+            self.rate_limit()
+            
+            # Ensure contract is qualified first
+            qualified = self.ib.qualifyContracts(contract)
+            if not qualified:
+                self.logger.error(f"Failed to qualify contract for {contract.symbol}")
+                return None
+            
+            qualified_contract = qualified[0]
+            
+            # Request market data
+            ticker = self.ib.reqMktData(qualified_contract, '', True, False)  # snapshot=True
+            
+            # Wait briefly for data
+            self.ib.sleep(2.0)
+            
+            snapshot = {
+                'symbol': contract.symbol,
+                'last': float(ticker.last) if ticker.last and ticker.last > 0 else None,
+                'bid': float(ticker.bid) if ticker.bid and ticker.bid > 0 else None,
+                'ask': float(ticker.ask) if ticker.ask and ticker.ask > 0 else None,
+                'close': float(ticker.close) if ticker.close and ticker.close > 0 else None,
+                'volume': int(ticker.volume) if ticker.volume else None,
+                'timestamp': time.time()
+            }
+            
+            # Cancel the market data subscription
+            self.ib.cancelMktData(qualified_contract)
+            
+            self.logger.debug(f"Market snapshot for {contract.symbol}: {snapshot}")
+            return snapshot
+            
+        except Exception as e:
+            self.logger.error(f"Failed to get market snapshot for {contract.symbol}: {e}")
+            return None
     
     def rate_limit(self):
         """Apply rate limiting to API requests using synchronous sleep"""
