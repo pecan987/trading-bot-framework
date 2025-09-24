@@ -116,9 +116,7 @@ def main() -> None:
             if hasattr(trader, 'shutdown'):
                 trader.shutdown()
             elif hasattr(trader, 'cleanup'):
-                # IBKR trader uses cleanup method
-                import asyncio
-                asyncio.run(trader.cleanup())
+                trader.cleanup()
         sys.exit(0)
     
     # Register signal handlers
@@ -168,29 +166,22 @@ def main() -> None:
         logger.warning(f"Starting PAPER TRADING with {data_source} - Virtual money only!")
     elif config.broker == "ibkr":
         account_type = os.getenv('IBKR_ACCOUNT_TYPE', 'paper').upper()
-        logger.warning(f"Starting IBKR {account_type} TRADING - REAL MONEY AT RISK!")
+        logger.warning(f"Starting IBKR {account_type} TRADING")
     else:
         logger.warning(f"Starting LIVE TRADING with {data_source} - REAL MONEY AT RISK!")
 
     # Initialize trader if IBKR
     if config.broker == "ibkr":
-        import asyncio
-        if not asyncio.run(trader.initialize()):
+        if not trader.initialize():
             logger.error("Failed to initialize IBKR trader")
             return
 
     # Main trading loop
     while True:
         try:
-            # Process each symbol using the proven trading cycle
-            if config.broker == "ibkr":
-                # IBKR uses async operations
-                for symbol in config.symbols:
-                    asyncio.run(trader.run_trading_cycle(symbol, strategy))
-            else:
-                # CCXT traders use sync operations
-                for symbol in config.symbols:
-                    trader.run_trading_cycle(symbol, strategy)
+            # Process each symbol using the trading cycle
+            for symbol in config.symbols:
+                trader.run_trading_cycle(symbol, strategy)
 
             # Get performance summary
             performance = trader.get_performance_summary()

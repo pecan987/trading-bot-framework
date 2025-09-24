@@ -12,6 +12,8 @@ class BaseStrategy(ABC):
     def __init__(self, name: str, parameters: Optional[Dict[str, Any]] = None):
         self.name = name
         self.parameters = parameters or {}
+        # Subclasses should set this property
+        self.min_bars_required = 50  # Default minimum bars required
         
     @abstractmethod
     def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:

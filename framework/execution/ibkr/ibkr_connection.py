@@ -1,31 +1,27 @@
 """
-IBKR connection management with auto-reconnection and error handling.
+IBKR connection management - Synchronous implementation using ib_async properly
 """
 
-import asyncio
 import time
-from contextlib import asynccontextmanager
 from typing import Optional, Callable, Any
 
 from ib_async import IB, Stock, Forex, Index, Contract
-from framework.utils.logger import get_logger
+from framework.utils.logger import setup_logger
 from .ibkr_config import IBKRConfig
 
 
-class IBKRConnectionManager:
+class IBKRConnection:
     """
-    Professional IBKR connection management with auto-reconnection, 
-    error handling, and rate limiting.
+    Synchronous IBKR connection management using ib_async library properly
     """
     
     def __init__(self, config: IBKRConfig):
         self.config = config
-        self.logger = get_logger(__name__)
+        self.logger = setup_logger("INFO")
         
         # Connection state
         self.ib = IB()
         self.connected = False
-        self.connecting = False
         self.reconnect_attempts = 0
         self.last_error = None
         
@@ -33,46 +29,8 @@ class IBKRConnectionManager:
         self.request_interval = 1.0 / config.max_requests_per_second
         self.last_request_time = 0.0
         
-        # Callbacks
-        self.on_connected_callback: Optional[Callable] = None
-        self.on_disconnected_callback: Optional[Callable] = None
-        self.on_error_callback: Optional[Callable] = None
-        
         # Set up event handlers
-        self.ib.connectedEvent += self._on_connected
-        self.ib.disconnectedEvent += self._on_disconnected
         self.ib.errorEvent += self._on_error
-        self.ib.timeoutEvent += self._on_timeout
-    
-    def _on_connected(self):
-        """Handle connection events"""
-        self.connected = True
-        self.connecting = False
-        self.reconnect_attempts = 0
-        self.logger.info("Connected to IBKR successfully")
-        
-        if self.on_connected_callback:
-            try:
-                self.on_connected_callback()
-            except Exception as e:
-                self.logger.error(f"Error in connected callback: {e}")
-    
-    def _on_disconnected(self):
-        """Handle disconnection events"""
-        self.connected = False
-        self.connecting = False
-        self.logger.warning("Disconnected from IBKR")
-        
-        if self.on_disconnected_callback:
-            try:
-                self.on_disconnected_callback()
-            except Exception as e:
-                self.logger.error(f"Error in disconnected callback: {e}")
-        
-        # Auto-reconnect if enabled
-        if self.config.auto_reconnect and self.reconnect_attempts < self.config.max_reconnect_attempts:
-            self.logger.info(f"Auto-reconnecting in {self.config.reconnect_delay} seconds...")
-            asyncio.create_task(self._auto_reconnect())
     
     def _on_error(self, reqId: int, errorCode: int, errorString: str, contract: Contract = None):
         """Handle IBKR errors"""
@@ -93,33 +51,10 @@ class IBKRConnectionManager:
             self.logger.error(f"IBKR Error [{errorCode}]: {errorString}")
         else:
             self.logger.debug(f"IBKR Message [{errorCode}]: {errorString}")
-        
-        if self.on_error_callback:
-            try:
-                self.on_error_callback(reqId, errorCode, errorString, contract)
-            except Exception as e:
-                self.logger.error(f"Error in error callback: {e}")
     
-    def _on_timeout(self, idlePeriod: float):
-        """Handle timeout events"""
-        self.logger.warning(f"IBKR connection timeout after {idlePeriod:.1f}s of inactivity")
-    
-    async def _auto_reconnect(self):
-        """Auto-reconnection logic"""
-        await asyncio.sleep(self.config.reconnect_delay)
-        
-        if not self.connected and self.reconnect_attempts < self.config.max_reconnect_attempts:
-            self.reconnect_attempts += 1
-            self.logger.info(f"Reconnection attempt {self.reconnect_attempts}/{self.config.max_reconnect_attempts}")
-            
-            try:
-                await self.connect()
-            except Exception as e:
-                self.logger.error(f"Reconnection attempt {self.reconnect_attempts} failed: {e}")
-    
-    async def connect(self) -> bool:
+    def connect(self) -> bool:
         """
-        Connect to IBKR TWS/IB Gateway
+        Connect to IBKR TWS/IB Gateway using synchronous methods
         
         Returns:
             bool: True if connected successfully
@@ -128,76 +63,56 @@ class IBKRConnectionManager:
             self.logger.info("Already connected to IBKR")
             return True
         
-        if self.connecting:
-            self.logger.info("Connection attempt already in progress")
-            return False
-        
-        self.connecting = True
-        
         try:
             self.logger.info(f"Connecting to IBKR at {self.config.host}:{self.config.port} (client_id={self.config.client_id})")
             
-            await self.ib.connectAsync(
+            # Use synchronous connect method
+            self.ib.connect(
                 host=self.config.host,
                 port=self.config.port,
                 clientId=self.config.client_id,
-                timeout=self.config.connect_timeout,
-                readonly=False  # We need trading permissions
+                timeout=self.config.connect_timeout
             )
             
+            self.connected = True
+            self.reconnect_attempts = 0
+            
             # Wait a moment for connection to stabilize
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
+            
+            # Set market data type
+            self.ib.reqMarketDataType(self.config.market_data_type.value)
+            self.logger.info(f"Market data type set to: {self.config.market_data_type.name}")
             
             # Verify account access
+            managed_accounts = self.ib.managedAccounts()
+            self.logger.info(f"Managed accounts: {managed_accounts}")
+            
             if self.config.account_id:
-                managed_accounts = self.ib.managedAccounts()
-                self.logger.info(f"Managed accounts: {managed_accounts}")
                 self.logger.info(f"Configured account ID: '{self.config.account_id}'")
                 if self.config.account_id not in managed_accounts:
                     raise ValueError(f"Account {self.config.account_id} not accessible. Available: {managed_accounts}")
             else:
                 self.logger.info("No account ID configured - using default account")
             
-            return self.connected
+            self.logger.info("Connected to IBKR successfully")
+            return True
             
         except Exception as e:
-            self.connecting = False
+            self.connected = False
             self.logger.error(f"Failed to connect to IBKR: {e}")
-            raise
+            return False
     
-    async def disconnect(self):
+    def disconnect(self):
         """Disconnect from IBKR"""
         if self.connected:
             self.logger.info("Disconnecting from IBKR")
             self.ib.disconnect()
-            await asyncio.sleep(0.1)  # Allow disconnect to complete
-        
-        self.connected = False
-        self.connecting = False
+            self.connected = False
     
     def is_connected(self) -> bool:
         """Check if currently connected"""
         return self.connected and self.ib.isConnected()
-    
-    def get_connection_stats(self) -> Optional[dict]:
-        """Get connection statistics"""
-        if self.connected:
-            try:
-                # Try the connectionStats method if available
-                if hasattr(self.ib, 'connectionStats'):
-                    return self.ib.connectionStats()
-                else:
-                    # Fallback to basic connection info
-                    return {
-                        'connected': self.ib.isConnected(),
-                        'client_id': self.config.client_id,
-                        'host': self.config.host,
-                        'port': self.config.port
-                    }
-            except Exception as e:
-                self.logger.debug(f"Could not get connection stats: {e}")
-                return {'connected': self.ib.isConnected()}
-        return None
     
     def get_managed_accounts(self) -> list:
         """Get list of managed accounts"""
@@ -205,25 +120,27 @@ class IBKRConnectionManager:
             return self.ib.managedAccounts()
         return []
     
-    def set_callbacks(self, 
-                     on_connected: Optional[Callable] = None,
-                     on_disconnected: Optional[Callable] = None,
-                     on_error: Optional[Callable] = None):
-        """Set event callbacks"""
-        self.on_connected_callback = on_connected
-        self.on_disconnected_callback = on_disconnected
-        self.on_error_callback = on_error
+    def get_account_summary(self) -> list:
+        """Get account summary using synchronous method"""
+        if not self.connected:
+            return []
+        
+        try:
+            return self.ib.accountSummary()
+        except Exception as e:
+            self.logger.warning(f"Could not get account summary: {e}")
+            return []
     
-    async def rate_limit(self):
-        """Apply rate limiting to API requests"""
-        now = time.time()
-        elapsed = now - self.last_request_time
+    def get_positions(self) -> list:
+        """Get current positions"""
+        if not self.connected:
+            return []
         
-        if elapsed < self.request_interval:
-            sleep_time = self.request_interval - elapsed
-            await asyncio.sleep(sleep_time)
-        
-        self.last_request_time = time.time()
+        try:
+            return self.ib.positions()
+        except Exception as e:
+            self.logger.error(f"Failed to get positions: {e}")
+            return []
     
     def create_contract(self, symbol: str, sec_type: str = 'STK', 
                        exchange: str = 'SMART', currency: str = 'USD') -> Contract:
@@ -251,22 +168,106 @@ class IBKRConnectionManager:
             contract.currency = currency
             return contract
     
-    @asynccontextmanager
-    async def connection_context(self):
-        """Context manager for automatic connection/disconnection"""
+    def qualify_contract(self, contract: Contract) -> bool:
+        """Qualify contract with IBKR using synchronous method"""
+        if not self.connected:
+            self.logger.error("Not connected to IBKR")
+            return False
+        
         try:
-            await self.connect()
-            yield self
-        finally:
-            await self.disconnect()
+            self.rate_limit()
+            qualified = self.ib.qualifyContracts(contract)
+            return len(qualified) > 0
+        except Exception as e:
+            self.logger.error(f"Failed to qualify contract {contract.symbol}: {e}")
+            return False
+    
+    def get_historical_data(self, contract: Contract, duration: str = '1 D', 
+                           bar_size: str = '1 hour', what_to_show: str = 'MIDPOINT') -> list:
+        """Get historical data using synchronous method"""
+        if not self.connected:
+            self.logger.error("Not connected to IBKR")
+            return []
+        
+        try:
+            self.rate_limit()
+            bars = self.ib.reqHistoricalData(
+                contract=contract,
+                endDateTime='',
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow=what_to_show,
+                useRTH=True
+            )
+            return bars
+        except Exception as e:
+            self.logger.error(f"Failed to get historical data for {contract.symbol}: {e}")
+            return []
+    
+    def place_order(self, contract: Contract, order) -> Optional[Any]:
+        """Place order using synchronous method"""
+        if not self.connected:
+            self.logger.error("Not connected to IBKR")
+            return None
+        
+        try:
+            self.rate_limit()
+            trade = self.ib.placeOrder(contract, order)
+            return trade
+        except Exception as e:
+            self.logger.error(f"Failed to place order: {e}")
+            return None
+    
+    def cancel_order(self, order) -> bool:
+        """Cancel order"""
+        if not self.connected:
+            self.logger.error("Not connected to IBKR")
+            return False
+        
+        try:
+            self.ib.cancelOrder(order)
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to cancel order: {e}")
+            return False
+    
+    def get_open_orders(self) -> list:
+        """Get open orders"""
+        if not self.connected:
+            return []
+        
+        try:
+            return self.ib.openOrders()
+        except Exception as e:
+            self.logger.error(f"Failed to get open orders: {e}")
+            return []
+    
+    def rate_limit(self):
+        """Apply rate limiting to API requests using synchronous sleep"""
+        now = time.time()
+        elapsed = now - self.last_request_time
+        
+        if elapsed < self.request_interval:
+            sleep_time = self.request_interval - elapsed
+            time.sleep(sleep_time)
+        
+        self.last_request_time = time.time()
+    
+    def get_last_error(self) -> Optional[dict]:
+        """Get the last error that occurred"""
+        return self.last_error
+    
+    def clear_last_error(self):
+        """Clear the last error"""
+        self.last_error = None
     
     def __repr__(self) -> str:
-        return f"IBKRConnectionManager(connected={self.connected}, config={self.config})"
+        return f"IBKRConnection(connected={self.connected}, config={self.config})"
 
 
-async def test_connection(config: IBKRConfig) -> bool:
+def test_connection(config: IBKRConfig) -> bool:
     """
-    Test IBKR connection
+    Test IBKR connection synchronously
     
     Args:
         config: IBKR configuration
@@ -274,21 +275,32 @@ async def test_connection(config: IBKRConfig) -> bool:
     Returns:
         bool: True if connection successful
     """
-    manager = IBKRConnectionManager(config)
+    connection = IBKRConnection(config)
     
     try:
-        success = await manager.connect()
+        success = connection.connect()
         if success:
             print(f"✅ Successfully connected to IBKR")
-            print(f"📊 Managed accounts: {manager.get_managed_accounts()}")
-            print(f"📈 Connection stats: {manager.get_connection_stats()}")
+            print(f"📊 Managed accounts: {connection.get_managed_accounts()}")
+            
+            # Test account summary
+            account_summary = connection.get_account_summary()
+            if account_summary:
+                print(f"💰 Account summary: {len(account_summary)} items")
+                for item in account_summary[:3]:
+                    print(f"   - {item.tag}: {item.value} {item.currency}")
+            
+            # Test positions
+            positions = connection.get_positions()
+            print(f"📈 Current positions: {len(positions)}")
+            
         else:
             print(f"❌ Failed to connect to IBKR")
         
-        await manager.disconnect()
+        connection.disconnect()
         return success
         
     except Exception as e:
         print(f"❌ Connection test failed: {e}")
-        await manager.disconnect()
+        connection.disconnect()
         return False

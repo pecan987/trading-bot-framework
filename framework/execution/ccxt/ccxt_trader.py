@@ -9,6 +9,7 @@ from typing import Dict, Optional, Any, List
 import logging
 from enum import Enum
 from dataclasses import dataclass, asdict
+from framework.utils.logger import setup_logger
 
 from .state_persistence import StateStore
 from framework.utils.postgres_state_store import PostgreSQLStateStore
@@ -16,7 +17,6 @@ from framework.utils.simple_state_store import SimpleStateStore
 from .position_sync import PositionSynchronizer
 from .data_manager import DataManager
 from framework.utils.latency_monitor import measure_api_latency
-from framework.utils.logger import get_logger
 from framework.monitoring.alert_system import AlertSystem
 from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
 from framework.risk.fixed_risk_manager import FixedRiskManager
@@ -52,7 +52,7 @@ class CCXTTrader:
     
     def __init__(self, config):
         self.config = config
-        self.logger = get_logger("TradingBot.ccxt_trader")
+        self.logger = setup_logger("INFO")
         
         # State management - PostgreSQL with file fallback
         self.logger.info(
@@ -621,7 +621,7 @@ class CCXTTrader:
             elif self._should_stop_loss(position, current_price):
                 action = {'type': 'stop_loss', 'size': -position_size}
                 self.logger.debug(
-                    "Normal strategy action: short stop loss triggered",
+                    "Normal strategy action: short ALso triggered",
                     extra={'action': action}
                 )
                 return action

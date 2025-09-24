@@ -163,6 +163,32 @@ class PostgreSQLStateStore:
                 }
             )
     
+    def load_state(self) -> Dict[str, Any]:
+        """Load complete state (positions and orders) from database"""
+        try:
+            positions = self.load_positions()
+            orders = self.load_orders()
+            
+            return {
+                'positions': positions,
+                'orders': orders,
+                'daily_pnl': 0.0  # This could be stored separately if needed
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to load state: {e}")
+            return {}
+    
+    def save_state(self, state: Dict[str, Any]) -> None:
+        """Save complete state (positions and orders) to database"""
+        try:
+            if 'positions' in state:
+                self.save_positions(state['positions'])
+            if 'orders' in state:
+                self.save_orders(state['orders'])
+            # Could also save daily_pnl if needed
+        except Exception as e:
+            self.logger.error(f"Failed to save state: {e}")
+    
     def load_positions(self) -> Dict[str, Any]:
         """Load positions from database"""
         try:

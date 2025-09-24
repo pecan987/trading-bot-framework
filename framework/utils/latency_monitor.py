@@ -7,9 +7,9 @@ from decimal import Decimal
 import threading
 from collections import defaultdict, deque
 
-from framework.utils.logger import get_logger
+from framework.utils.logger import setup_logger
 
-logger = get_logger(__name__)
+logger = setup_logger("INFO")
 
 
 class LatencyMetrics:

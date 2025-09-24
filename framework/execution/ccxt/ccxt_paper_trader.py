@@ -13,7 +13,7 @@ from dataclasses import dataclass, asdict
 from framework.utils.postgres_state_store import PostgreSQLStateStore
 from framework.utils.simple_state_store import SimpleStateStore
 from framework.utils.latency_monitor import measure_api_latency
-from framework.utils.logger import get_logger
+from framework.utils.logger import setup_logger
 from framework.monitoring.alert_system import AlertSystem
 from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
 from framework.risk.fixed_risk_manager import FixedRiskManager
@@ -49,7 +49,7 @@ class CCXTPaperTrader:
     
     def __init__(self, config):
         self.config = config
-        self.logger = get_logger("TradingBot.paper_trader")
+        self.logger = setup_logger("INFO")
         
         # State management
         self.logger.info(

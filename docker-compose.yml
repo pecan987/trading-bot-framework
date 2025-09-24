@@ -13,12 +13,15 @@ services:
       - DB_NAME=${DB_NAME:-trading}
       - DB_USER=${DB_USER:-trading_user}
       - DB_PASSWORD=${DB_PASSWORD:-trading_password}
-      - IBKR_HOST=localhost
+      - IBKR_HOST=${IBKR_HOST:-localhost}
+      - IBKR_PORT=${IBKR_PORT:-4002}
       - METRICS_PORT=8000
     ports:
       - "8000:8000"  # Metrics endpoint
     volumes:
       - ./:/app
+    networks:
+      - default
     depends_on:
       postgres:
         condition: service_healthy
@@ -118,43 +121,51 @@ services:
       postgres:
         condition: service_healthy
 
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib_gateway
+    restart: unless-stopped
+    environment:
+      # Interactive Brokers credentials (set in .env file)
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+      TWS_USERID_PAPER: ${TWS_USERID:-}
+      TWS_PASSWORD_PAPER: ${TWS_PASSWORD:-}
+
+      # Trading mode: paper or live
+      TRADING_MODE: ${GATEWAY_TRADING_MODE:-paper}
+
+      # Optional VNC access
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+
+      # Accept incoming connections
+      TWS_ACCEPT_INCOMING: "accept"
+      
+      # Auto-accept API connections (bypass confirmation dialog)
+      READ_ONLY_API: "no"
+      BYPASS_WARNING: "yes"
+      ALLOW_BLIND_TRADING: "yes"
+      
+      # Enable delayed market data (free)
+      DELAYED_MARKET_DATA: "yes"
+
+      # Timezone
+      TIME_ZONE: ${TZ:-America/New_York}
+
+    # Map IB Gateway ports to different localhost ports to bypass TrustedIPs restriction
+    ports:
+      - "127.0.0.1:4003:4001"  # Live API port: container 4001 -> host 4003 (localhost only)
+      - "127.0.0.1:4004:4002"  # Paper API port: container 4002 -> host 4004 (localhost only)
+      - "127.0.0.1:5900:5900"  # VNC port (localhost only)
+
+    volumes:
+      # Persist IB Gateway settings and logs
+      - ib_gateway_data:/opt/ibc
+      - ib_gateway_logs:/root/Jts
+
 volumes:
   postgres_data:
   prometheus_data:
   grafana_data:
   ib_gateway_data:
   ib_gateway_logs:
-
-#  ib-gateway:
-#    image: ghcr.io/gnzsnz/ib-gateway:stable
-#    container_name: ib_gateway
-#    restart: unless-stopped
-#    environment:
-#      # Interactive Brokers credentials (set in .env file)
-#      TWS_USERID: ${TWS_USERID:-}
-#      TWS_PASSWORD: ${TWS_PASSWORD:-}
-#
-#      # Trading mode: paper or live
-#      TRADING_MODE: ${GATEWAY_TRADING_MODE:-paper}
-#
-#      # Optional VNC access
-#      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
-#
-#      # Accept incoming connections
-#      TWS_ACCEPT_INCOMING: "yes"
-#
-#      # Timezone
-#      TIME_ZONE: ${TZ:-America/New_York}
-#
-#    ports:
-#      # Map IB Gateway API ports to host
-#      - "4001:4001"  # Live API port
-#      - "4002:4002"  # Paper API port
-#
-#      # VNC port (optional, for GUI access)
-#      - "5900:5900"
-#
-#    volumes:
-#      # Persist IB Gateway settings and logs
-#      - ib_gateway_data:/opt/ibc
-#      - ib_gateway_logs:/root/Jts

@@ -1,317 +1,151 @@
+#!/usr/bin/env python
 """
-IBKR trader implementation with comprehensive risk management integration.
+Clean IBKR Trader implementation using ibkr_config and ibkr_connection utilities
 """
 
-import asyncio
+import os
 import time
-from datetime import datetime, timedelta
-from decimal import Decimal
-from enum import Enum
-from typing import Dict, List, Optional, Any, Tuple
 import pandas as pd
+from typing import Optional, Dict, Any
+from dotenv import load_dotenv
 
-from ib_async import IB, Stock, Forex, MarketOrder, LimitOrder, Order, Trade, Position, AccountValue
-from framework.utils.logger import get_logger
-from framework.utils.postgres_state_store import PostgreSQLStateStore
-from framework.utils.simple_state_store import SimpleStateStore
-from framework.monitoring.alert_system import AlertSystem
-from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
-from framework.risk.fixed_risk_manager import FixedRiskManager
-from framework.risk.strategy_position_size_manager import StrategyPositionSizeManager
-from .ibkr_config import IBKRConfig, IBKRAccountType, IBKRMarketDataType
-from .ibkr_connection import IBKRConnectionManager
-
-
-class OrderStatus(Enum):
-    """Order status enumeration"""
-    PENDING = "pending"
-    SUBMITTED = "submitted"
-    FILLED = "filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-    ERROR = "error"
+from ib_async import MarketOrder, LimitOrder, StopOrder
+from framework.utils.logger import setup_logger
+from .ibkr_config import IBKRConfig
+from .ibkr_connection import IBKRConnection
 
 
 class IBKRTrader:
     """
-    Professional IBKR trader with risk management integration.
-    
-    Features:
-    - Risk management integration (fixed position, fixed risk, strategy-based)
-    - Position synchronization with IBKR accounts
-    - Order management with real-time status tracking
-    - Market data integration (real-time, delayed, historical)
-    - Paper and live trading support
-    - State persistence and recovery
-    - Alert system integration
-    - Comprehensive error handling and reconnection
+    Clean IBKR trader implementation using configuration and connection separation
     """
     
-    def __init__(self, config):
-        """Initialize IBKR trader with configuration"""
-        self.config = config
+    def __init__(self, config=None):
+        load_dotenv()
         
-        # Use "ibkr" as exchange name for IBKR trading
-        exchange_name = "ibkr"
-        self.logger = get_logger(f"{__name__}.{exchange_name}")
+        # Store main config for later use
+        self.main_config = config
         
-        # IBKR-specific configuration
+        # Create IBKR configuration from environment
         self.ibkr_config = IBKRConfig.from_env()
         
-        # Connection manager
-        self.connection = IBKRConnectionManager(self.ibkr_config)
-        self.ib = self.connection.ib
-        
-        # State management - Try PostgreSQL first, fallback to file storage
-        try:
-            self.state_store = PostgreSQLStateStore(
-                exchange=f"ibkr_{exchange_name}",
-                instance_id=f"ibkr_{exchange_name}_{config.timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
-            self.logger.info("Using PostgreSQL state store")
-        except Exception as e:
-            self.logger.warning(f"Failed to initialize PostgreSQL state store: {e}, using file storage")
-            self.state_store = SimpleStateStore(f"ibkr_{exchange_name}_{config.timeframe}")
-        self.positions = {}
-        self.orders = {}
-        
-        # Risk management
-        self.risk_manager = self._initialize_risk_manager(config)
-        self.daily_pnl = 0.0
-        self.initial_balance = None
-        self.emergency_stop = False
-        self.daily_loss_limit = getattr(config, 'daily_loss_limit', 1000.0)
-        
-        # Alert system
-        self.alert_system = AlertSystem(config)
-        
-        # Market data cache
-        self.market_data_cache = {}
-        self.last_data_update = {}
-        
-        # Order tracking
-        self.pending_orders = {}
-        self.order_counter = 0
-        
-        # Database logger
-        from framework.utils.async_db_logger import get_db_logger
-        try:
-            self.db_logger = get_db_logger()
-            self.db_logging_enabled = True
-            self.logger.info("Database logging enabled")
-        except Exception as e:
-            self.logger.warning(f"Failed to initialize database logger: {e}")
-            self.db_logger = None
-            self.db_logging_enabled = False
-        
-        self.logger.info(f"IBKR trader initialized: {self.ibkr_config}")
-        self.logger.info(f"Risk Manager: {self.risk_manager.get_description()}")
-    
-    def _initialize_risk_manager(self, config):
-        """Initialize risk manager based on configuration"""
-        risk_manager_type = getattr(config, 'risk_manager_type', 'fixed_position')
-        risk_manager_params = getattr(config, 'risk_manager_params', {})
-        
-        if risk_manager_type == "fixed_position":
-            risk_manager = FixedPositionSizeManager(
-                position_size=risk_manager_params.get('position_size', 0.1)
-            )
-        elif risk_manager_type == "fixed_risk":
-            risk_manager = FixedRiskManager(
-                risk_percent=risk_manager_params.get('risk_percent', 0.01),
-                default_stop_distance=risk_manager_params.get('default_stop_distance', 0.02)
-            )
-        elif risk_manager_type == "strategy_position":
-            risk_manager = StrategyPositionSizeManager(
-                max_position_size=risk_manager_params.get('max_position_size', 1.0),
-                min_position_size=risk_manager_params.get('min_position_size', 0.001),
-                apply_safety_limits=risk_manager_params.get('apply_safety_limits', True)
-            )
+        # Override with main config if provided
+        if config:
+            if hasattr(config, 'timeframe'):
+                self.timeframe = config.timeframe
+            else:
+                self.timeframe = os.getenv('TIMEFRAME', '15min')
         else:
-            self.logger.warning(f"Unknown risk manager type: {risk_manager_type}, using fixed_position")
-            risk_manager = FixedPositionSizeManager(position_size=0.1)
+            self.timeframe = os.getenv('TIMEFRAME', '15min')
         
-        return risk_manager
+        # Trading parameters
+        self.initial_capital = float(os.getenv('INITIAL_CAPITAL', '10000'))
+        self.position_size_pct = 0.1  # 10% of capital per trade
+        
+        # Create connection
+        self.connection = IBKRConnection(self.ibkr_config)
+        self.logger = setup_logger("INFO")
+        
+        # State tracking
+        self.positions = {}
+        
+        self.logger.info(f"IBKR Trader initialized - {self.ibkr_config}")
     
-    async def initialize(self) -> bool:
-        """Initialize IBKR trader and establish connection"""
+    def initialize(self) -> bool:
+        """Initialize connection to IBKR"""
         try:
-            # Connect to IBKR
-            if not await self.connection.connect():
-                self.logger.error("Failed to connect to IBKR")
+            if not self.connection.connect():
                 return False
             
-            # Set market data type
-            await self._set_market_data_type()
+            # Sync initial positions
+            self._sync_positions()
             
-            # Load state
-            await self._load_state()
-            
-            # Synchronize positions
-            await self._sync_positions()
-            
-            # Get account information
-            await self._update_account_info()
-            
-            self.logger.info("IBKR trader initialization complete")
+            self.logger.info("IBKR Trader initialization complete")
             return True
             
         except Exception as e:
             self.logger.error(f"Failed to initialize IBKR trader: {e}")
             return False
     
-    async def _set_market_data_type(self):
-        """Set market data type for subscriptions"""
-        try:
-            self.ib.reqMarketDataType(self.ibkr_config.market_data_type.value)
-            self.logger.info(f"Market data type set to: {self.ibkr_config.market_data_type.name}")
-            await asyncio.sleep(0.1)  # Allow request to process
-        except Exception as e:
-            self.logger.error(f"Failed to set market data type: {e}")
+    def cleanup(self):
+        """Cleanup method for main.py compatibility"""
+        self.connection.disconnect()
     
-    async def _load_state(self):
-        """Load trader state from storage"""
+    def _sync_positions(self):
+        """Sync positions from IBKR"""
         try:
-            state = self.state_store.load_state()
-            if state:
-                self.positions = state.get('positions', {})
-                self.orders = state.get('orders', {})
-                self.daily_pnl = state.get('daily_pnl', 0.0)
-                self.logger.info(f"State loaded: {len(self.positions)} positions, {len(self.orders)} orders")
-            else:
-                self.logger.info("No previous state found")
-        except Exception as e:
-            self.logger.error(f"Failed to load state: {e}")
-    
-    async def _save_state(self):
-        """Save trader state to storage"""
-        try:
-            state = {
-                'positions': self.positions,
-                'orders': self.orders,
-                'daily_pnl': self.daily_pnl,
-                'timestamp': time.time()
-            }
-            self.state_store.save_state(state)
-            self.logger.debug("State saved successfully")
-        except Exception as e:
-            self.logger.error(f"Failed to save state: {e}")
-    
-    async def _sync_positions(self):
-        """Synchronize positions with IBKR account"""
-        try:
-            await self.connection.rate_limit()
-            positions = self.ib.positions()
-            
-            self.logger.info(f"Synchronizing {len(positions)} positions from IBKR")
+            positions = self.connection.get_positions()
+            self.positions = {}
             
             for pos in positions:
                 if abs(pos.position) > 0:  # Only active positions
-                    symbol = self._contract_to_symbol(pos.contract)
-                    
+                    symbol = pos.contract.symbol
                     self.positions[symbol] = {
                         'size': float(pos.position),
-                        'entry_price': float(pos.avgCost) if pos.avgCost else 0.0,
-                        'market_value': float(pos.marketValue) if pos.marketValue else 0.0,
-                        'unrealized_pnl': float(pos.unrealizedPNL) if pos.unrealizedPNL else 0.0,
+                        'entry_price': float(pos.avgCost) if hasattr(pos, 'avgCost') and pos.avgCost else 0.0,
                         'contract': pos.contract,
                         'last_update': time.time()
                     }
-                    
-                    self.logger.info(f"Position sync: {symbol} size={pos.position} avgCost={pos.avgCost}")
+                    self.logger.info(f"Position: {symbol} = {pos.position} shares @ ${pos.avgCost}")
             
-            await self._save_state()
-            
+            if not self.positions:
+                self.logger.info("No open positions")
+                
         except Exception as e:
             self.logger.error(f"Failed to sync positions: {e}")
     
-    async def _update_account_info(self):
-        """Update account information and balance"""
-        try:
-            await self.connection.rate_limit()
-            
-            # Request account updates
-            if self.ibkr_config.account_id:
-                account_id = self.ibkr_config.account_id
-            else:
-                accounts = self.ib.managedAccounts()
-                account_id = accounts[0] if accounts else None
-            
-            if not account_id:
-                self.logger.error("No account ID available")
-                return
-            
-            # Get account values
-            account_values = self.ib.accountValues(account=account_id)
-            
-            for av in account_values:
-                if av.tag == 'NetLiquidation' and av.currency == 'USD':
-                    balance = float(av.value)
-                    if self.initial_balance is None:
-                        self.initial_balance = balance
-                        self.logger.info(f"Initial balance set: ${balance:,.2f}")
-                    break
-            
-        except Exception as e:
-            self.logger.error(f"Failed to update account info: {e}")
-    
-    def _contract_to_symbol(self, contract) -> str:
-        """Convert IBKR contract to symbol string"""
-        if contract.secType == 'FOREX':
-            return f"{contract.symbol}/{contract.currency}"
-        else:
-            return contract.symbol
-    
-    def _symbol_to_contract(self, symbol: str):
-        """Convert symbol to IBKR contract"""
-        # Handle forex pairs
-        if '/' in symbol:
-            base, quote = symbol.split('/')
-            return Forex(f"{base}{quote}")
-        else:
-            # Default to stock
-            return Stock(symbol, 'SMART', 'USD')
-    
-    async def get_market_data(self, symbol: str, timeframe: str, lookback: int = 100) -> Optional[pd.DataFrame]:
+    def get_market_data(self, symbol: str, timeframe: str = '15min', lookback: int = 100) -> Optional[pd.DataFrame]:
         """
-        Get historical market data from IBKR
+        Get historical market data for a symbol
         
         Args:
-            symbol: Trading symbol
-            timeframe: Data timeframe (1m, 5m, 15m, 1h, 4h, 1D)
+            symbol: Trading symbol (e.g., 'AAPL')
+            timeframe: Timeframe ('1min', '5min', '15min', '1h', '1D')
             lookback: Number of bars to retrieve
-            
+        
         Returns:
-            DataFrame with OHLCV data or None if failed
+            DataFrame with OHLCV data
         """
         try:
-            await self.connection.rate_limit()
-            
-            # Check cache
-            cache_key = f"{symbol}_{timeframe}"
-            now = time.time()
-            
-            if (cache_key in self.market_data_cache and 
-                cache_key in self.last_data_update and
-                now - self.last_data_update[cache_key] < 30):  # 30 second cache
-                return self.market_data_cache[cache_key]
+            if not self.connection.is_connected():
+                self.logger.error("Not connected to IBKR")
+                return None
             
             # Create contract
-            contract = self._symbol_to_contract(symbol)
+            contract = self.connection.create_contract(symbol)
+            
+            # Qualify contract
+            if not self.connection.qualify_contract(contract):
+                self.logger.error(f"Failed to qualify contract for {symbol}")
+                return None
+            
+            # Map timeframe to bar size
+            bar_size_map = {
+                '1min': '1 min',
+                '5min': '5 mins', 
+                '15min': '15 mins',
+                '30min': '30 mins',
+                '1h': '1 hour',
+                '4h': '4 hours',
+                '1D': '1 day'
+            }
+            
+            bar_size = bar_size_map.get(timeframe, '15 mins')
+            
+            # Calculate duration
+            if timeframe in ['1D', '4h']:
+                duration = f"{lookback} D"
+            else:
+                duration = f"{lookback * 2} H"  # Give some buffer
             
             # Request historical data
-            duration = f"{lookback} D" if timeframe in ['1D', '4h'] else f"{lookback * 2} H"
-            bar_size = self._timeframe_to_bar_size(timeframe)
+            self.logger.debug(f"Requesting {lookback} bars of {symbol} ({bar_size})")
             
-            bars = self.ib.reqHistoricalData(
+            bars = self.connection.get_historical_data(
                 contract=contract,
-                endDateTime='',
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow='MIDPOINT',
-                useRTH=True,
-                formatDate=1,
-                timeout=self.ibkr_config.historical_data_timeout
+                duration=duration,
+                bar_size=bar_size,
+                what_to_show='MIDPOINT'
             )
             
             if not bars:
@@ -319,356 +153,30 @@ class IBKRTrader:
                 return None
             
             # Convert to DataFrame
-            df = pd.DataFrame([{
-                'open': float(bar.open),
-                'high': float(bar.high),
-                'low': float(bar.low),
-                'close': float(bar.close),
-                'volume': int(bar.volume)
-            } for bar in bars])
+            data = []
+            for bar in bars:
+                data.append({
+                    'open': float(bar.open),
+                    'high': float(bar.high),
+                    'low': float(bar.low),
+                    'close': float(bar.close),
+                    'volume': int(bar.volume)
+                })
             
-            # Set datetime index
+            df = pd.DataFrame(data)
             df.index = pd.to_datetime([bar.date for bar in bars])
             df.index.name = 'datetime'
             
-            # Cache the data
-            self.market_data_cache[cache_key] = df
-            self.last_data_update[cache_key] = now
-            
-            return df.tail(lookback)  # Return only requested number of bars
+            self.logger.info(f"✓ Retrieved {len(df)} bars for {symbol}")
+            return df.tail(lookback)  # Return requested number of bars
             
         except Exception as e:
             self.logger.error(f"Failed to get market data for {symbol}: {e}")
             return None
     
-    def _timeframe_to_bar_size(self, timeframe: str) -> str:
-        """Convert timeframe to IBKR bar size"""
-        mapping = {
-            '1m': '1 min',
-            '5m': '5 mins',
-            '15m': '15 mins',
-            '30m': '30 mins',
-            '1h': '1 hour',
-            '4h': '4 hours',
-            '1D': '1 day'
-        }
-        return mapping.get(timeframe, '1 min')
-    
-    async def execute_trade(self, symbol: str, signal: int, current_price: float, strategy) -> bool:
+    def run_trading_cycle(self, symbol: str, strategy) -> bool:
         """
-        Execute trade based on strategy signal
-        
-        Args:
-            symbol: Trading symbol
-            signal: Trading signal (1=buy, -1=sell, 0=hold)
-            current_price: Current market price
-            strategy: Strategy instance
-            
-        Returns:
-            bool: True if trade executed successfully
-        """
-        try:
-            if self.emergency_stop:
-                self.logger.warning("Emergency stop active - no new trades")
-                return False
-            
-            # Check daily loss limit
-            if abs(self.daily_pnl) > self.daily_loss_limit:
-                self.logger.error(f"Daily loss limit reached: {self.daily_pnl}")
-                self.emergency_stop = True
-                if self.alert_system:
-                    alert_message = f"*** EMERGENCY STOP: Daily loss limit reached!\nDaily P&L: {self.daily_pnl:.2f} USD\nLimit: {self.daily_loss_limit:.2f} USD\nTrading halted."
-                    self.alert_system.send_alert(alert_message, "error")
-                return False
-            
-            current_position = self.positions.get(symbol, {'size': 0, 'entry_price': None})
-            position_size = current_position['size']
-            
-            # Determine action
-            action = self._determine_action(current_position, signal, current_price, strategy)
-            
-            if action['action'] == 'hold':
-                return True
-            
-            # Execute the order
-            return await self._execute_order(symbol, action, current_price)
-            
-        except Exception as e:
-            self.logger.error(f"Failed to execute trade for {symbol}: {e}")
-            return False
-    
-    def _determine_action(self, position: dict, signal: float, current_price: float, strategy) -> dict:
-        """Determine what action to take based on position and signal"""
-        position_size = position.get('size', 0)
-        strategy_name = self.config.strategy_name
-        
-        # No position - enter based on signal
-        if position_size == 0:
-            if signal == 1:
-                return {'action': 'buy', 'reason': f'{strategy_name}: Buy signal'}
-            elif signal == -1:
-                return {'action': 'sell', 'reason': f'{strategy_name}: Sell signal'}
-            else:
-                return {'action': 'hold', 'reason': 'No signal'}
-        
-        # Long position
-        elif position_size > 0:
-            if signal == -1:
-                return {'action': 'sell', 'reason': f'{strategy_name}: Exit long position'}
-            elif signal == 1:
-                return {'action': 'hold', 'reason': 'Already long'}
-            else:
-                return {'action': 'hold', 'reason': 'Holding long position'}
-        
-        # Short position
-        elif position_size < 0:
-            if signal == 1:
-                return {'action': 'buy', 'reason': f'{strategy_name}: Cover short position'}
-            elif signal == -1:
-                return {'action': 'hold', 'reason': 'Already short'}
-            else:
-                return {'action': 'hold', 'reason': 'Holding short position'}
-        
-        return {'action': 'hold', 'reason': 'Unknown state'}
-    
-    async def _execute_order(self, symbol: str, action: dict, current_price: float) -> bool:
-        """Execute an order through IBKR"""
-        try:
-            contract = self._symbol_to_contract(symbol)
-            
-            # Calculate position size
-            if action['action'] in ['buy', 'sell']:
-                current_position = self.positions.get(symbol, {'size': 0})
-                
-                if current_position['size'] == 0:  # Opening position
-                    quantity = await self._calculate_position_size(symbol, current_price)
-                    if action['action'] == 'sell':
-                        quantity = -quantity  # Short position
-                else:  # Closing position
-                    quantity = -current_position['size']  # Close full position
-                
-                if abs(quantity) < 0.001:  # Minimum position size
-                    self.logger.warning(f"Position size too small: {quantity}")
-                    return False
-                
-                # Create order
-                order = MarketOrder('BUY' if quantity > 0 else 'SELL', abs(quantity))
-                
-                # Submit order
-                await self.connection.rate_limit()
-                trade = self.ib.placeOrder(contract, order)
-                
-                # Track order
-                order_id = f"ibkr_{int(time.time())}_{self.order_counter}"
-                self.order_counter += 1
-                
-                self.pending_orders[order_id] = {
-                    'trade': trade,
-                    'symbol': symbol,
-                    'action': action['action'],
-                    'quantity': quantity,
-                    'price': current_price,
-                    'timestamp': time.time(),
-                    'reason': action['reason']
-                }
-                
-                self.logger.info(f"Order submitted: {action['action']} {abs(quantity)} {symbol} @ ${current_price:.2f} - {action['reason']}")
-                
-                # Wait for order status
-                await asyncio.sleep(0.5)
-                await self._check_order_status(order_id)
-                
-                await self._save_state()
-                return True
-            
-            return False
-            
-        except Exception as e:
-            self.logger.error(f"Failed to execute order: {e}")
-            return False
-    
-    async def _calculate_position_size(self, symbol: str, current_price: float) -> float:
-        """Calculate position size using risk manager"""
-        try:
-            # Get account balance
-            if self.initial_balance:
-                available_balance = self.initial_balance
-            else:
-                available_balance = self.config.initial_capital
-            
-            # Use risk manager for position sizing
-            signal = 1  # For position sizing calculation
-            position_size_ratio = self.risk_manager.calculate_position_size(
-                signal=signal,
-                current_price=current_price,
-                equity=available_balance
-            )
-            
-            # Convert ratio to actual quantity
-            position_value = available_balance * position_size_ratio
-            position_size = position_value / current_price
-            
-            return position_size
-            
-        except Exception as e:
-            self.logger.error(f"Failed to calculate position size: {e}")
-            return 0.0
-    
-    async def _check_order_status(self, order_id: str):
-        """Check and update order status"""
-        try:
-            if order_id not in self.pending_orders:
-                return
-            
-            order_info = self.pending_orders[order_id]
-            trade = order_info['trade']
-            
-            # Check if order is filled
-            if trade.orderStatus.status == 'Filled':
-                filled_qty = trade.orderStatus.filled
-                avg_price = trade.orderStatus.avgFillPrice
-                
-                # Update position
-                symbol = order_info['symbol']
-                if symbol not in self.positions:
-                    self.positions[symbol] = {'size': 0, 'entry_price': None}
-                
-                old_size = self.positions[symbol]['size']
-                new_size = old_size + (filled_qty if order_info['action'] == 'buy' else -filled_qty)
-                
-                if abs(new_size) < 0.001:  # Position closed
-                    # Calculate PnL
-                    if old_size != 0 and self.positions[symbol]['entry_price']:
-                        pnl = (avg_price - self.positions[symbol]['entry_price']) * abs(old_size)
-                        if old_size < 0:  # Short position
-                            pnl = -pnl
-                        self.daily_pnl += pnl
-                        
-                        pnl_indicator = "PROFIT" if pnl > 0 else "LOSS"
-                        self.logger.info(f"Position closed: {symbol} P&L = {pnl_indicator} ${pnl:.2f}")
-                    
-                    self.positions[symbol] = {'size': 0, 'entry_price': None}
-                else:
-                    # Position opened/modified
-                    if abs(old_size) < 0.001:  # New position
-                        self.positions[symbol]['entry_price'] = avg_price
-                    self.positions[symbol]['size'] = new_size
-                
-                # Remove from pending orders
-                del self.pending_orders[order_id]
-                
-                self.logger.info(f"Order filled: {order_info['action']} {filled_qty} {symbol} @ ${avg_price:.2f}")
-                
-                # Database logging
-                if self.db_logging_enabled:
-                    try:
-                        # Generate unique trade ID
-                        trade_id = f"ibkr_{symbol}_{int(trade.order.orderId)}_{int(time.time())}"
-                        
-                        # Log trade
-                        self.db_logger.log_trade(
-                            trade_id=trade_id,
-                            symbol=symbol,
-                            side='buy' if order_info['action'] == 'buy' else 'sell',
-                            quantity=filled_qty,
-                            price=avg_price,
-                            status='filled',
-                            order_type='market',
-                            strategy=getattr(self.config, 'strategy_name', None),
-                            fee=0,  # IBKR fees are calculated separately
-                            fee_currency='USD',
-                            executed_at=datetime.now(),
-                            metadata={
-                                'ibkr_order_id': trade.order.orderId,
-                                'action': order_info['action'],
-                                'reason': order_info.get('reason', ''),
-                                'exchange': 'ibkr'
-                            }
-                        )
-                        
-                        # Log position update
-                        if abs(new_size) < 0.001:  # Position closed
-                            self.db_logger.update_position(
-                                symbol=symbol,
-                                quantity=0,
-                                entry_price=self.positions[symbol].get('entry_price', avg_price),
-                                side='long' if old_size > 0 else 'short',
-                                strategy=getattr(self.config, 'strategy_name', None),
-                                metadata={
-                                    'close_time': datetime.now().isoformat(),
-                                    'close_price': avg_price,
-                                    'pnl': pnl if 'pnl' in locals() else 0,
-                                    'exchange': 'ibkr'
-                                }
-                            )
-                        else:  # Position opened/modified
-                            self.db_logger.update_position(
-                                symbol=symbol,
-                                quantity=new_size,
-                                entry_price=avg_price if abs(old_size) < 0.001 else self.positions[symbol].get('entry_price', avg_price),
-                                side='long' if new_size > 0 else 'short',
-                                strategy=getattr(self.config, 'strategy_name', None),
-                                metadata={
-                                    'entry_time': datetime.now().isoformat() if abs(old_size) < 0.001 else None,
-                                    'exchange': 'ibkr'
-                                }
-                            )
-                        
-                        # Log balance (get current account value)
-                        account_values = self.ib.accountValues()
-                        total_value = 0
-                        for av in account_values:
-                            if av.tag == 'TotalCashValue' and av.currency == 'USD':
-                                total_value = float(av.value)
-                                break
-                        
-                        if total_value > 0:
-                            self.db_logger.log_balance(
-                                account_id=f"ibkr_{self.ibkr_config.account_id}",
-                                total_balance=total_value,
-                                free_balance=total_value,  # Simplified for now
-                                used_balance=0,
-                                currency='USD',
-                                metadata={'exchange': 'ibkr', 'account_type': self.ibkr_config.account_type.value}
-                            )
-                    except Exception as e:
-                        self.logger.warning(f"Failed to log IBKR trade to database: {e}")
-                
-            elif trade.orderStatus.status in ['Cancelled', 'ApiCancelled']:
-                self.logger.warning(f"Order cancelled: {order_id}")
-                del self.pending_orders[order_id]
-                
-        except Exception as e:
-            self.logger.error(f"Failed to check order status: {e}")
-    
-    async def cleanup(self):
-        """Cleanup trader resources"""
-        try:
-            await self._save_state()
-            await self.connection.disconnect()
-            self.logger.info("IBKR trader cleanup complete")
-        except Exception as e:
-            self.logger.error(f"Error during cleanup: {e}")
-    
-    def get_positions(self) -> Dict[str, Dict]:
-        """Get current positions"""
-        return self.positions.copy()
-    
-    def get_balance(self) -> float:
-        """Get current account balance"""
-        return self.initial_balance or self.config.initial_capital
-    
-    def get_daily_pnl(self) -> float:
-        """Get daily P&L"""
-        return self.daily_pnl
-    
-    def is_emergency_stop(self) -> bool:
-        """Check if emergency stop is active"""
-        return self.emergency_stop
-    
-    async def run_trading_cycle(self, symbol: str, strategy) -> bool:
-        """
-        Run one trading cycle for a symbol (compatibility method for main.py)
+        Run one trading cycle for a symbol
         
         Args:
             symbol: Trading symbol
@@ -678,13 +186,15 @@ class IBKRTrader:
             bool: True if cycle completed successfully
         """
         try:
-            if self.emergency_stop:
+            if not self.connection.is_connected():
+                self.logger.error("Not connected to IBKR")
                 return False
             
-            # Get market data
-            df = await self.get_market_data(symbol, self.config.timeframe)
+            # Get market data - request more bars to ensure we have enough
+            lookback_bars = max(100, strategy.min_bars_required)
+            df = self.get_market_data(symbol, self.timeframe, lookback_bars)
             if df is None or len(df) < strategy.min_bars_required:
-                self.logger.warning(f"Insufficient data for {symbol}")
+                self.logger.warning(f"Insufficient data for {symbol}: got {len(df) if df is not None else 0}, need {strategy.min_bars_required}")
                 return False
             
             # Generate signals
@@ -695,33 +205,258 @@ class IBKRTrader:
             latest_signal = signals['signal'].iloc[-1]
             current_price = df['close'].iloc[-1]
             
+            # Extract SL/TP if provided by strategy
+            stop_loss = None
+            take_profit = None
+            
+            if 'stop_loss' in signals.columns:
+                sl_val = signals['stop_loss'].iloc[-1]
+                if pd.notna(sl_val) and sl_val > 0:
+                    stop_loss = float(sl_val)
+            
+            if 'take_profit' in signals.columns:
+                tp_val = signals['take_profit'].iloc[-1]
+                if pd.notna(tp_val) and tp_val > 0:
+                    take_profit = float(tp_val)
+            
+            # Log signal
+            self.logger.info(f"{symbol}: Signal={latest_signal}, Price=${current_price:.2f}")
+            if stop_loss:
+                self.logger.info(f"  Stop Loss: ${stop_loss:.2f}")
+            if take_profit:
+                self.logger.info(f"  Take Profit: ${take_profit:.2f}")
+            
             # Execute trade
-            return await self.execute_trade(symbol, latest_signal, current_price, strategy)
+            return self.execute_trade(symbol, latest_signal, current_price, stop_loss, take_profit)
             
         except Exception as e:
             self.logger.error(f"Error in trading cycle for {symbol}: {e}")
             return False
     
-    def get_performance_summary(self) -> dict:
-        """Get performance summary (compatibility method for main.py)"""
+    def execute_trade(self, symbol: str, signal: int, current_price: float, 
+                     stop_loss: float = None, take_profit: float = None) -> bool:
+        """
+        Execute trade based on signal
+        
+        Args:
+            symbol: Trading symbol
+            signal: 1=buy, -1=sell, 0=hold
+            current_price: Current market price
+            stop_loss: Stop loss price (optional)
+            take_profit: Take profit price (optional)
+            
+        Returns:
+            bool: True if trade executed successfully
+        """
         try:
+            if signal == 0:  # Hold
+                return True
+            
+            current_position = self.positions.get(symbol, {'size': 0})
+            position_size = current_position['size']
+            
+            # Determine action
+            if position_size == 0:  # No position
+                if signal == 1:  # Buy signal
+                    return self._place_buy_order(symbol, current_price, stop_loss, take_profit)
+                elif signal == -1:  # Sell signal  
+                    return self._place_sell_order(symbol, current_price, stop_loss, take_profit)
+            
+            elif position_size > 0:  # Long position
+                if signal == -1:  # Exit long
+                    return self._close_position(symbol, current_price)
+            
+            elif position_size < 0:  # Short position
+                if signal == 1:  # Cover short
+                    return self._close_position(symbol, current_price)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to execute trade: {e}")
+            return False
+    
+    def _place_buy_order(self, symbol: str, price: float, stop_loss: float = None, take_profit: float = None) -> bool:
+        """Place a buy order"""
+        try:
+            # Calculate position size
+            quantity = self._calculate_quantity(price)
+            if quantity <= 0:
+                self.logger.warning(f"Invalid quantity: {quantity}")
+                return False
+            
+            # Create contract
+            contract = self.connection.create_contract(symbol)
+            
+            self.logger.info(f"Placing BUY order: {quantity} {symbol} @ ${price:.2f}")
+            
+            # Place order with bracket if SL/TP provided
+            if stop_loss or take_profit:
+                return self._place_bracket_order(contract, 'BUY', quantity, price, stop_loss, take_profit)
+            else:
+                # Simple market order
+                order = MarketOrder('BUY', quantity)
+                trade = self.connection.place_order(contract, order)
+                
+                if trade:
+                    # Wait for order to process
+                    time.sleep(0.5)
+                    self.logger.info(f"✓ Buy order placed: {quantity} {symbol}")
+                    return True
+                else:
+                    return False
+            
+        except Exception as e:
+            self.logger.error(f"Failed to place buy order: {e}")
+            return False
+    
+    def _place_sell_order(self, symbol: str, price: float, stop_loss: float = None, take_profit: float = None) -> bool:
+        """Place a sell order (short)"""
+        try:
+            # Calculate position size
+            quantity = self._calculate_quantity(price)
+            if quantity <= 0:
+                self.logger.warning(f"Invalid quantity: {quantity}")
+                return False
+            
+            # Create contract
+            contract = self.connection.create_contract(symbol)
+            
+            self.logger.info(f"Placing SELL order: {quantity} {symbol} @ ${price:.2f}")
+            
+            # Place order with bracket if SL/TP provided
+            if stop_loss or take_profit:
+                return self._place_bracket_order(contract, 'SELL', quantity, price, stop_loss, take_profit)
+            else:
+                # Simple market order
+                order = MarketOrder('SELL', quantity)
+                trade = self.connection.place_order(contract, order)
+                
+                if trade:
+                    # Wait for order to process
+                    time.sleep(0.5)
+                    self.logger.info(f"✓ Sell order placed: {quantity} {symbol}")
+                    return True
+                else:
+                    return False
+            
+        except Exception as e:
+            self.logger.error(f"Failed to place sell order: {e}")
+            return False
+    
+    def _close_position(self, symbol: str, price: float) -> bool:
+        """Close existing position"""
+        try:
+            position = self.positions.get(symbol)
+            if not position:
+                self.logger.warning(f"No position to close for {symbol}")
+                return True
+            
+            current_size = position['size']
+            quantity = abs(current_size)
+            action = 'SELL' if current_size > 0 else 'BUY'
+            
+            contract = self.connection.create_contract(symbol)
+            order = MarketOrder(action, quantity)
+            
+            self.logger.info(f"Closing position: {action} {quantity} {symbol}")
+            
+            trade = self.connection.place_order(contract, order)
+            if trade:
+                time.sleep(0.5)
+                self.logger.info(f"✓ Position closed: {symbol}")
+                return True
+            else:
+                return False
+            
+        except Exception as e:
+            self.logger.error(f"Failed to close position: {e}")
+            return False
+    
+    def _place_bracket_order(self, contract, action: str, quantity: int, entry_price: float, 
+                            stop_loss: float = None, take_profit: float = None) -> bool:
+        """
+        Place bracket order with stop loss and take profit
+        """
+        try:
+            self.logger.info(f"Creating bracket order: {action} {quantity}")
+            
+            # 1. Parent order (limit order for better control)
+            parent_order = LimitOrder(action, quantity, entry_price)
+            parent_order.transmit = False  # Don't transmit yet
+            
+            # Place parent order
+            parent_trade = self.connection.place_order(contract, parent_order)
+            if not parent_trade:
+                self.logger.error("Failed to place parent order")
+                return False
+                
+            parent_id = parent_order.orderId
+            
+            self.logger.info(f"  Parent order: {action} {quantity} @ ${entry_price:.2f}")
+            
+            # 2. Stop loss order
+            if stop_loss:
+                stop_action = 'SELL' if action == 'BUY' else 'BUY'
+                stop_order = StopOrder(stop_action, quantity, stop_loss)
+                stop_order.parentId = parent_id
+                stop_order.transmit = False
+                
+                self.connection.place_order(contract, stop_order)
+                self.logger.info(f"  Stop Loss: {stop_action} {quantity} @ ${stop_loss:.2f}")
+            
+            # 3. Take profit order
+            if take_profit:
+                profit_action = 'SELL' if action == 'BUY' else 'BUY'
+                profit_order = LimitOrder(profit_action, quantity, take_profit)
+                profit_order.parentId = parent_id
+                profit_order.transmit = True  # Transmit all orders
+                
+                self.connection.place_order(contract, profit_order)
+                self.logger.info(f"  Take Profit: {profit_action} {quantity} @ ${take_profit:.2f}")
+            else:
+                # No take profit, transmit parent order
+                parent_order.transmit = True
+                self.connection.place_order(contract, parent_order)
+            
+            time.sleep(0.5)
+            self.logger.info("✓ Bracket order placed successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to place bracket order: {e}")
+            # Fallback to simple market order
+            fallback_order = MarketOrder(action, quantity)
+            self.connection.place_order(contract, fallback_order)
+            return True
+    
+    def _calculate_quantity(self, price: float) -> int:
+        """Calculate position quantity based on capital and price"""
+        try:
+            # Use percentage of capital
+            position_value = self.initial_capital * self.position_size_pct
+            quantity = int(position_value / price)
+            
+            # Minimum 1 share
+            return max(1, quantity)
+            
+        except Exception as e:
+            self.logger.error(f"Failed to calculate quantity: {e}")
+            return 1  # Fallback to 1 share
+    
+    def get_performance_summary(self) -> dict:
+        """Get basic performance summary"""
+        try:
+            total_positions = len(self.positions)
+            
             return {
-                'daily_pnl': self.get_daily_pnl(),
-                'open_positions': len(self.get_positions()),
-                'initial_balance': self.get_balance(),
-                'current_balance': self.get_balance() + self.get_daily_pnl(),
-                'total_pnl': self.get_daily_pnl(),
-                'emergency_stop': self.is_emergency_stop(),
-                'mode': f'IBKR {self.ibkr_config.account_type.value.upper()}'
+                'connected': self.connection.is_connected(),
+                'open_positions': total_positions,
+                'accounts': self.connection.get_managed_accounts(),
+                'initial_capital': self.initial_capital,
+                'config': str(self.ibkr_config)
             }
+            
         except Exception as e:
             self.logger.error(f"Error getting performance summary: {e}")
-            return {
-                'daily_pnl': 0,
-                'open_positions': 0,
-                'initial_balance': 0,
-                'current_balance': 0,
-                'total_pnl': 0,
-                'emergency_stop': True,
-                'mode': 'IBKR ERROR'
-            }
+            return {'error': str(e)}
