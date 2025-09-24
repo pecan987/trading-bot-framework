@@ -1,0 +1,83 @@
+groups:
+  - name: trading_bot_alerts
+    interval: 30s
+    rules:
+      # Database connectivity alert
+      - alert: PostgreSQLDown
+        expr: up{job="postgres-exporter"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "PostgreSQL database has been down for more than 1 minute"
+
+      # High database connection usage
+      - alert: PostgreSQLTooManyConnections
+        expr: sum(pg_stat_database_numbackends) / sum(pg_settings_max_connections) * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL too many connections"
+          description: "PostgreSQL instance has too many connections (> 80%)"
+
+      # High CPU usage
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage detected"
+          description: "CPU usage is above 80% for more than 5 minutes"
+
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage detected"
+          description: "Memory usage is above 90% for more than 5 minutes"
+
+      # Disk space alert
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low disk space"
+          description: "Disk space is below 10%"
+
+      # Trading bot specific alerts
+      - alert: TradingBotDown
+        expr: up{job="trading-bot"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trading bot is down"
+          description: "Trading bot has been down for more than 1 minute"
+
+      # High API latency
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, rate(api_request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency detected"
+          description: "95th percentile API latency is above 2 seconds"
+
+      # Failed trades alert
+      - alert: HighFailedTradeRate
+        expr: rate(trades_failed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High rate of failed trades"
+          description: "Failed trade rate is above 10% in the last 5 minutes"

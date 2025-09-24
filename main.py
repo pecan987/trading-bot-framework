@@ -14,6 +14,7 @@ from framework.strategies.breakout_strategy import BreakoutStrategy
 from framework.strategies.fvg_strategy import FVGStrategy
 from framework.strategies.mean_reversion_strategy import MeanReversionStrategy
 from framework.strategies.test_strategy import TestStrategy
+from framework.utils.metrics_server import start_metrics_server, stop_metrics_server
 
 
 # Simple config class using environment variables
@@ -87,6 +88,7 @@ class SimpleConfig:
         return params
 
 
+
 def main() -> None:
     """Main trading bot function"""
     # Load configuration
@@ -97,14 +99,24 @@ def main() -> None:
     logger = setup_logger(config.log_level)
     logger.info("Starting trading bot...")
     
+    # Start metrics server for Prometheus
+    metrics_port = int(os.getenv('METRICS_PORT', '8000'))
+    if start_metrics_server(port=metrics_port):
+        logger.info(f"Metrics server started on port {metrics_port}")
+    else:
+        logger.warning("Failed to start metrics server")
+    
     # Global trader reference for signal handler
     trader = None
     
     def signal_handler(signum, frame):
         """Handle shutdown signals gracefully"""
         logger.info(f"Received signal {signum}, shutting down gracefully...")
-        if trader and hasattr(trader, 'shutdown'):
-            trader.shutdown()
+        if trader:
+            if hasattr(trader, 'shutdown'):
+                trader.shutdown()
+            elif hasattr(trader, 'cleanup'):
+                trader.cleanup()
         sys.exit(0)
     
     # Register signal handlers
@@ -138,8 +150,13 @@ def main() -> None:
         from framework.execution.ccxt.ccxt_trader import CCXTTrader
         trader = CCXTTrader(config)
         logger.warning("*** USING LIVE TRADING WITH REAL MONEY ***")
+    elif config.broker == "ibkr":
+        # Interactive Brokers trading (LIVE - requires IBKR account)
+        from framework.execution.ibkr.ibkr_trader import IBKRTrader
+        trader = IBKRTrader(config)
+        logger.warning("*** USING IBKR TRADING - REAL MONEY AT RISK ***")
     else:
-        raise ValueError(f"Unknown broker: {config.broker}. Use 'paper_ccxt' or 'ccxt'")
+        raise ValueError(f"Unknown broker: {config.broker}. Use 'paper_ccxt', 'ccxt', or 'ibkr'")
 
     logger.info(f"Using strategy: {strategy.__class__.__name__}")
 
@@ -147,13 +164,22 @@ def main() -> None:
     data_source = "SANDBOX" if config.use_sandbox else "LIVE DATA"
     if config.broker == "paper_ccxt":
         logger.warning(f"Starting PAPER TRADING with {data_source} - Virtual money only!")
+    elif config.broker == "ibkr":
+        account_type = os.getenv('IBKR_ACCOUNT_TYPE', 'paper').upper()
+        logger.warning(f"Starting IBKR {account_type} TRADING")
     else:
         logger.warning(f"Starting LIVE TRADING with {data_source} - REAL MONEY AT RISK!")
+
+    # Initialize trader if IBKR
+    if config.broker == "ibkr":
+        if not trader.initialize():
+            logger.error("Failed to initialize IBKR trader")
+            return
 
     # Main trading loop
     while True:
         try:
-            # Process each symbol using the proven trading cycle
+            # Process each symbol using the trading cycle
             for symbol in config.symbols:
                 trader.run_trading_cycle(symbol, strategy)
 
@@ -190,6 +216,7 @@ def main() -> None:
 
         except KeyboardInterrupt:
             logger.info("Shutting down...")
+            stop_metrics_server()
             break
         except Exception as e:
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)

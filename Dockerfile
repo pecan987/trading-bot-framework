@@ -26,6 +26,7 @@ RUN uv sync --frozen
 COPY framework/ framework/
 COPY scripts/ scripts/
 COPY main.py .
+COPY test_ibkr.py .
 
 # Create necessary directories
 RUN mkdir -p logs data output trading_state

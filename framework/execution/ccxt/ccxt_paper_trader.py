@@ -10,9 +10,10 @@ import logging
 from enum import Enum
 from dataclasses import dataclass, asdict
 
+from framework.utils.postgres_state_store import PostgreSQLStateStore
 from framework.utils.simple_state_store import SimpleStateStore
 from framework.utils.latency_monitor import measure_api_latency
-from framework.utils.logger import get_logger
+from framework.utils.logger import setup_logger
 from framework.monitoring.alert_system import AlertSystem
 from framework.risk.fixed_position_size_manager import FixedPositionSizeManager
 from framework.risk.fixed_risk_manager import FixedRiskManager
@@ -48,7 +49,7 @@ class CCXTPaperTrader:
     
     def __init__(self, config):
         self.config = config
-        self.logger = get_logger("TradingBot.paper_trader")
+        self.logger = setup_logger("INFO")
         
         # State management
         self.logger.info(
@@ -58,7 +59,29 @@ class CCXTPaperTrader:
                 'initial_capital': self.config.initial_capital
             }
         )
-        self.state_store = SimpleStateStore(exchange=self.config.exchange_name.upper())
+        
+        # Try PostgreSQL first, fallback to file storage
+        try:
+            self.state_store = PostgreSQLStateStore(
+                exchange=self.config.exchange_name.upper(),
+                instance_id=f"paper_{self.config.exchange_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            storage_type = 'PostgreSQL'
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to initialize PostgreSQL state store: {e}, falling back to file storage",
+                extra={'error': str(e)}
+            )
+            self.state_store = SimpleStateStore(exchange=self.config.exchange_name.upper())
+            storage_type = 'SimpleFileStore'
+        
+        self.logger.info(
+            "State store initialized",
+            extra={
+                'storage_type': storage_type,
+                'exchange': self.config.exchange_name.upper()
+            }
+        )
         
         # Safety settings
         self.emergency_stop = False
@@ -74,6 +97,11 @@ class CCXTPaperTrader:
         self.current_balance = config.initial_capital
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
+        
+        # Balance tracking for margin trading
+        self.total_equity = config.initial_capital  # Total equity (initial + realized PnL)
+        self.used_margin = 0.0  # Margin used for open positions
+        self.margin_rate = 0.1  # 10% margin requirement (10x leverage)
         
         # Legacy position sizing setting (now handled by risk manager)
         self.max_position_pct = config.max_position_size
@@ -91,6 +119,17 @@ class CCXTPaperTrader:
         
         # Initialize risk manager
         self.risk_manager = self._initialize_risk_manager(config)
+        
+        # Database logger - auto-detect PostgreSQL availability
+        from framework.utils.async_db_logger import get_db_logger
+        try:
+            self.db_logger = get_db_logger()
+            self.db_logging_enabled = True
+            self.logger.info("Database logging enabled (PostgreSQL detected)")
+        except Exception as e:
+            self.logger.info(f"Database logging disabled (PostgreSQL not available: {e})")
+            self.db_logger = None
+            self.db_logging_enabled = False
         
         # Try to acquire lock
         lock_id = f"paper_trader_{config.exchange_name}_{config.timeframe}_{date.today().isoformat()}"
@@ -205,6 +244,7 @@ class CCXTPaperTrader:
         except Exception as e:
             self.logger.error(f"Failed to save state: {e}")
     
+    @measure_api_latency('ccxt_fetch_ohlcv', 'GET')
     def get_market_data(self, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
         """Get real market data from CCXT"""
         try:
@@ -225,6 +265,7 @@ class CCXTPaperTrader:
             self.logger.error(f"Failed to fetch market data for {symbol}: {e}")
             return pd.DataFrame()
     
+    @measure_api_latency('ccxt_fetch_ticker', 'GET')
     def get_current_price(self, symbol: str) -> float:
         """Get current market price"""
         try:
@@ -308,40 +349,64 @@ class CCXTPaperTrader:
             elif current_size == 0 and not self.allow_shorting:
                 self.logger.info(f"Short signal ignored for {symbol} - shorting disabled ({self.trading_type} mode)")
     
+    def _calculate_balance_components(self):
+        """Calculate total, free, and used balance components"""
+        # Update total equity
+        self.total_equity = self.initial_balance + self.realized_pnl
+        
+        # Calculate used margin for all open positions
+        self.used_margin = 0.0
+        for symbol, position in self.positions.items():
+            if position['size'] != 0:
+                # Margin = position value * margin rate
+                position_value = abs(position['size']) * position['entry_price']
+                self.used_margin += position_value * self.margin_rate
+        
+        # Free balance = total equity - used margin
+        free_balance = max(0, self.total_equity - self.used_margin)
+        
+        return {
+            'total_balance': self.total_equity,
+            'free_balance': free_balance,
+            'used_balance': self.used_margin
+        }
+    
     def _simulate_buy(self, symbol: str, price: float):
         """Simulate buying a position"""
         # Calculate position size using risk manager
-        total_equity = self.current_balance + self.unrealized_pnl
+        balances = self._calculate_balance_components()
         position_size_ratio = self.risk_manager.calculate_position_size(
             signal=1,
             current_price=price,
-            equity=total_equity
+            equity=balances['total_balance']
         )
         
         # Convert ratio to actual quantity
-        position_value = total_equity * position_size_ratio
+        position_value = balances['total_balance'] * position_size_ratio
         quantity = position_value / price
         
         # Apply slippage
         execution_price = price * (1 + self.slippage_rate)
         
-        # Calculate costs
-        total_cost = quantity * execution_price
-        commission = total_cost * self.commission_rate
-        total_with_commission = total_cost + commission
+        # Calculate margin requirement
+        position_notional = quantity * execution_price
+        margin_required = position_notional * self.margin_rate
+        commission = position_notional * self.commission_rate
         
-        if total_with_commission > self.current_balance:
-            self.logger.warning(f"Insufficient balance for {symbol} purchase")
+        # Check if we have enough free balance for margin + commission
+        if margin_required + commission > balances['free_balance']:
+            self.logger.warning(f"Insufficient free balance for {symbol} position (need {margin_required + commission:.2f}, have {balances['free_balance']:.2f})")
             return
         
-        # Execute simulated trade
+        # Execute simulated trade (margin-based, not full cost)
         self.positions[symbol] = {
             'size': quantity,
             'entry_price': execution_price,
             'timestamp': datetime.now().isoformat()
         }
         
-        self.current_balance -= total_with_commission
+        # Deduct only commission from realized PnL (margin is just reserved)
+        self.realized_pnl -= commission
         
         # Log trade
         self.logger.info(
@@ -349,9 +414,63 @@ class CCXTPaperTrader:
             f"(Commission: ${commission:.2f})"
         )
         
+        # Database logging
+        if self.db_logging_enabled:
+            try:
+                # Generate unique trade ID
+                trade_id = f"paper_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                
+                self.db_logger.log_trade(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    side='buy',
+                    quantity=quantity,
+                    price=execution_price,
+                    status='filled',
+                    order_type='market',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    fee=commission,
+                    fee_currency='USDT',
+                    executed_at=datetime.now(),
+                    metadata={
+                        'paper_trade': True,
+                        'slippage_rate': self.slippage_rate,
+                        'original_price': price,
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log position
+                self.db_logger.update_position(
+                    symbol=symbol,
+                    quantity=quantity,
+                    entry_price=execution_price,
+                    side='long',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    metadata={
+                        'paper_trade': True,
+                        'entry_time': datetime.now().isoformat(),
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log balance with correct margin accounting
+                current_balances = self._calculate_balance_components()
+                self.db_logger.log_balance(
+                    account_id=f"paper_{self.config.exchange_name}",
+                    total_balance=current_balances['total_balance'],
+                    free_balance=current_balances['free_balance'],
+                    used_balance=current_balances['used_balance'],
+                    currency='USDT',
+                    metadata={'paper_trade': True, 'exchange': self.config.exchange_name}
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to log paper trade to database: {e}")
+        
         # Send alert
         if self.alert_system:
-            alert_message = f"🎯 Paper Trade: LONG {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nBalance: ${self.current_balance:.2f}"
+            current_balances = self._calculate_balance_components()
+            alert_message = f"🎯 Paper Trade: LONG {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nEquity: ${current_balances['total_balance']:.2f}\nUsed Margin: ${current_balances['used_balance']:.2f}"
             self.alert_system.send_alert(alert_message, "info")
     
     def _simulate_sell(self, symbol: str, price: float):
@@ -371,13 +490,13 @@ class CCXTPaperTrader:
         commission = gross_proceeds * self.commission_rate
         net_proceeds = gross_proceeds - commission
         
-        # Calculate P&L
-        cost_basis = quantity * entry_price
-        gross_pnl = gross_proceeds - cost_basis
-        net_pnl = net_proceeds - cost_basis
+        # Calculate P&L for margin trading
+        # In margin trading, PnL = (exit_price - entry_price) * quantity, not full proceeds
+        gross_pnl = (execution_price - entry_price) * quantity
+        net_pnl = gross_pnl - commission
         
         # Execute simulated trade
-        self.current_balance += net_proceeds
+        # In margin trading, we add PnL to realized_pnl (margin gets freed up)
         self.realized_pnl += net_pnl
         self.daily_pnl += net_pnl
         
@@ -391,9 +510,69 @@ class CCXTPaperTrader:
             f"P&L: {pnl_indicator} ${net_pnl:.2f} (Commission: ${commission:.2f})"
         )
         
+        # Database logging
+        if self.db_logging_enabled:
+            self.logger.info(f"DB: Starting database logging for sell trade {symbol} @ {execution_price}")
+            try:
+                # Generate unique trade ID
+                trade_id = f"paper_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                
+                self.db_logger.log_trade(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    side='sell',
+                    quantity=quantity,
+                    price=execution_price,
+                    status='filled',
+                    order_type='market',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    fee=commission,
+                    fee_currency='USDT',
+                    executed_at=datetime.now(),
+                    metadata={
+                        'paper_trade': True,
+                        'slippage_rate': self.slippage_rate,
+                        'original_price': price,
+                        'entry_price': entry_price,
+                        'pnl': net_pnl,
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log position close
+                self.db_logger.update_position(
+                    symbol=symbol,
+                    quantity=0,
+                    entry_price=entry_price,
+                    exit_price=execution_price,
+                    side='long',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    metadata={
+                        'paper_trade': True,
+                        'close_time': datetime.now().isoformat(),
+                        'close_price': execution_price,
+                        'pnl': net_pnl,
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log balance with correct margin accounting
+                current_balances = self._calculate_balance_components()
+                self.db_logger.log_balance(
+                    account_id=f"paper_{self.config.exchange_name}",
+                    total_balance=current_balances['total_balance'],
+                    free_balance=current_balances['free_balance'],
+                    used_balance=current_balances['used_balance'],
+                    currency='USDT',
+                    metadata={'paper_trade': True, 'exchange': self.config.exchange_name}
+                )
+            except Exception as e:
+                self.logger.warning(f"Failed to log paper trade to database: {e}")
+        
         # Send alert
         if self.alert_system:
-            alert_message = f"Paper Position Closed ({pnl_indicator}): {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nBalance: ${self.current_balance:.2f}"
+            current_balances = self._calculate_balance_components()
+            alert_message = f"Paper Position Closed ({pnl_indicator}): {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nEquity: ${current_balances['total_balance']:.2f}"
             alert_level = "info" if net_pnl > 0 else "warning"
             self.alert_system.send_alert(alert_message, alert_level)
     
@@ -404,33 +583,39 @@ class CCXTPaperTrader:
             return
             
         # Calculate position size using risk manager
-        total_equity = self.current_balance + self.unrealized_pnl
+        balances = self._calculate_balance_components()
         position_size_ratio = self.risk_manager.calculate_position_size(
             signal=-1,
             current_price=price,
-            equity=total_equity
+            equity=balances['total_balance']
         )
         
         # Convert ratio to actual quantity (negative for short)
-        position_value = total_equity * position_size_ratio
+        position_value = balances['total_balance'] * position_size_ratio
         quantity = -(position_value / price)  # Negative for short
         
         # Apply slippage (worse fill for short)
         execution_price = price * (1 + self.slippage_rate)
         
-        # For shorting, we receive cash upfront but owe shares
-        total_proceeds = abs(quantity) * execution_price
-        commission = total_proceeds * self.commission_rate
-        net_proceeds = total_proceeds - commission
+        # Calculate margin requirement for short position
+        position_notional = abs(quantity) * execution_price
+        margin_required = position_notional * self.margin_rate
+        commission = position_notional * self.commission_rate
         
-        # Execute simulated short
+        # Check if we have enough free balance for margin + commission
+        if margin_required + commission > balances['free_balance']:
+            self.logger.warning(f"Insufficient free balance for {symbol} short position (need {margin_required + commission:.2f}, have {balances['free_balance']:.2f})")
+            return
+        
+        # Execute simulated short (margin-based)
         self.positions[symbol] = {
             'size': quantity,  # Negative for short
             'entry_price': execution_price,
             'timestamp': datetime.now().isoformat()
         }
         
-        self.current_balance += net_proceeds  # Receive cash from short sale
+        # Deduct only commission from realized PnL (margin is just reserved)
+        self.realized_pnl -= commission
         
         # Log trade
         self.logger.info(
@@ -438,9 +623,64 @@ class CCXTPaperTrader:
             f"(Commission: ${commission:.2f})"
         )
         
+        # Database logging
+        if self.db_logging_enabled:
+            try:
+                # Generate unique trade ID
+                trade_id = f"paper_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                
+                self.db_logger.log_trade(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    side='short',
+                    quantity=abs(quantity),
+                    price=execution_price,
+                    status='filled',
+                    order_type='market',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    fee=commission,
+                    fee_currency='USDT',
+                    executed_at=datetime.now(),
+                    metadata={
+                        'paper_trade': True,
+                        'slippage_rate': self.slippage_rate,
+                        'original_price': price,
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log position
+                self.db_logger.update_position(
+                    symbol=symbol,
+                    quantity=quantity,  # Negative for short
+                    entry_price=execution_price,
+                    side='short',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    metadata={
+                        'paper_trade': True,
+                        'entry_time': datetime.now().isoformat(),
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log balance with correct margin accounting
+                current_balances = self._calculate_balance_components()
+                self.db_logger.log_balance(
+                    account_id=f"paper_{self.config.exchange_name}",
+                    total_balance=current_balances['total_balance'],
+                    free_balance=current_balances['free_balance'],
+                    used_balance=current_balances['used_balance'],
+                    currency='USDT',
+                    metadata={'paper_trade': True, 'symbol': symbol, 'action': 'short_open'}
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Failed to log short position to database: {e}")
+
         # Send alert
         if self.alert_system:
-            alert_message = f"Paper Short Opened: {symbol}\nSize: {abs(quantity):.6f}\nPrice: ${execution_price:.2f}\nBalance: ${self.current_balance:.2f}"
+            current_balances = self._calculate_balance_components()
+            alert_message = f"Paper Short Opened: {symbol}\nSize: {abs(quantity):.6f}\nPrice: ${execution_price:.2f}\nEquity: ${current_balances['total_balance']:.2f}\nUsed Margin: ${current_balances['used_balance']:.2f}"
             self.alert_system.send_alert(alert_message, "info")
 
     def _simulate_buy_to_cover(self, symbol: str, price: float):
@@ -460,13 +700,13 @@ class CCXTPaperTrader:
         commission = total_cost * self.commission_rate
         total_with_commission = total_cost + commission
         
-        # Calculate P&L (profit when covering at lower price)
-        short_proceeds = quantity * entry_price  # What we received when shorting
-        gross_pnl = short_proceeds - total_cost  # Profit if covering cheaper
-        net_pnl = short_proceeds - total_with_commission
+        # Calculate P&L for short position cover
+        # For shorts: PnL = (entry_price - exit_price) * quantity (profitable when price drops)
+        gross_pnl = (entry_price - execution_price) * quantity
+        net_pnl = gross_pnl - commission
         
-        # Execute simulated cover
-        self.current_balance -= total_with_commission
+        # Execute simulated cover (margin-based)
+        # In margin trading, we just add PnL to realized_pnl (margin gets freed up)
         self.realized_pnl += net_pnl
         self.daily_pnl += net_pnl
         
@@ -480,9 +720,69 @@ class CCXTPaperTrader:
             f"P&L: {pnl_indicator} ${net_pnl:.2f} (Commission: ${commission:.2f})"
         )
         
+        # Database logging
+        if self.db_logging_enabled:
+            try:
+                # Generate unique trade ID
+                trade_id = f"paper_{symbol}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+                
+                self.db_logger.log_trade(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    side='buy_to_cover',
+                    quantity=quantity,
+                    price=execution_price,
+                    status='filled',
+                    order_type='market',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    fee=commission,
+                    fee_currency='USDT',
+                    executed_at=datetime.now(),
+                    metadata={
+                        'paper_trade': True,
+                        'slippage_rate': self.slippage_rate,
+                        'original_price': price,
+                        'entry_price': entry_price,
+                        'pnl': net_pnl,
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log position close
+                self.db_logger.update_position(
+                    symbol=symbol,
+                    quantity=0,
+                    entry_price=entry_price,
+                    exit_price=execution_price,
+                    side='short',
+                    strategy=getattr(self.config, 'strategy_name', None),
+                    metadata={
+                        'paper_trade': True,
+                        'close_time': datetime.now().isoformat(),
+                        'close_price': execution_price,
+                        'pnl': net_pnl,
+                        'exchange': self.config.exchange_name
+                    }
+                )
+                
+                # Log balance with correct margin accounting
+                current_balances = self._calculate_balance_components()
+                self.db_logger.log_balance(
+                    account_id=f"paper_{self.config.exchange_name}",
+                    total_balance=current_balances['total_balance'],
+                    free_balance=current_balances['free_balance'],
+                    used_balance=current_balances['used_balance'],
+                    currency='USDT',
+                    metadata={'paper_trade': True, 'symbol': symbol, 'action': 'short_close', 'pnl': net_pnl}
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Failed to log short cover to database: {e}")
+
         # Send alert
         if self.alert_system:
-            alert_message = f"Paper Short Covered ({pnl_indicator}): {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nBalance: ${self.current_balance:.2f}"
+            current_balances = self._calculate_balance_components()
+            alert_message = f"Paper Short Covered ({pnl_indicator}): {symbol}\nSize: {quantity:.6f}\nPrice: ${execution_price:.2f}\nP&L: ${net_pnl:.2f}\nEquity: ${current_balances['total_balance']:.2f}"
             alert_level = "info" if net_pnl > 0 else "warning"
             self.alert_system.send_alert(alert_message, alert_level)
     
@@ -509,7 +809,7 @@ class CCXTPaperTrader:
     
     def get_performance_summary(self) -> Dict:
         """Get performance summary"""
-        total_equity = self.current_balance + self.unrealized_pnl
+        balances = self._calculate_balance_components()
         total_pnl = self.realized_pnl + self.unrealized_pnl
         
         open_positions = sum(1 for pos in self.positions.values() if pos['size'] != 0)
@@ -518,9 +818,11 @@ class CCXTPaperTrader:
             'daily_pnl': self.daily_pnl,
             'open_positions': open_positions,
             'initial_balance': self.initial_balance,
-            'current_balance': self.current_balance,
+            'current_balance': balances['total_balance'],  # Use calculated total equity
             'total_pnl': total_pnl,
-            'total_equity': total_equity,
+            'total_equity': balances['total_balance'],
+            'free_balance': balances['free_balance'],
+            'used_margin': balances['used_balance'],
             'unrealized_pnl': self.unrealized_pnl,
             'realized_pnl': self.realized_pnl,
             'emergency_stop': self.emergency_stop,

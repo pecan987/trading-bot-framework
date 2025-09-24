@@ -1,4 +1,31 @@
 services:
+  trading_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trading_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-trading}
+      - DB_USER=${DB_USER:-trading_user}
+      - DB_PASSWORD=${DB_PASSWORD:-trading_password}
+      - IBKR_HOST=${IBKR_HOST:-localhost}
+      - IBKR_PORT=${IBKR_PORT:-4002}
+      - METRICS_PORT=8000
+    ports:
+      - "8000:8000"  # Metrics endpoint
+    volumes:
+      - ./:/app
+    networks:
+      - default
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   postgres:
     image: postgres:16-alpine
     container_name: trading_postgres
@@ -11,29 +38,131 @@ services:
       - "${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d
+      - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-trading_user} -d ${DB_NAME:-trading}"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  trading_bot:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: trading_bot
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading_prometheus
     restart: unless-stopped
-    env_file:
-      - .env
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    depends_on:
+      - postgres-exporter
+      - node-exporter
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: trading_postgres_exporter
+    restart: unless-stopped
     environment:
-      - DB_HOST=postgres
-      - DB_PORT=5432
+      DATA_SOURCE_NAME: "postgresql://${DB_USER:-trading_user}:${DB_PASSWORD:-trading_password}@postgres:5432/${DB_NAME:-trading}?sslmode=disable"
+    ports:
+      - "9187:9187"
     depends_on:
       postgres:
         condition: service_healthy
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: trading_node_exporter
+    restart: unless-stopped
+    command:
+      - '--path.rootfs=/host'
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
     volumes:
-      - ./:/app
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: false
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+
+  adminer:
+    image: adminer:latest
+    container_name: trading_adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: pepa-linha
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib_gateway
+    restart: unless-stopped
+    environment:
+      # Interactive Brokers credentials (set in .env file)
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+      TWS_USERID_PAPER: ${TWS_USERID:-}
+      TWS_PASSWORD_PAPER: ${TWS_PASSWORD:-}
+
+      # Trading mode: paper or live
+      TRADING_MODE: ${GATEWAY_TRADING_MODE:-paper}
+
+      # Optional VNC access
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+
+      # Accept incoming connections
+      TWS_ACCEPT_INCOMING: "accept"
+      
+      # Auto-accept API connections (bypass confirmation dialog)
+      READ_ONLY_API: "no"
+      BYPASS_WARNING: "yes"
+      ALLOW_BLIND_TRADING: "yes"
+
+      # Timezone
+      TIME_ZONE: ${TZ:-America/New_York}
+
+    # Map IB Gateway ports to different localhost ports to bypass TrustedIPs restriction
+    ports:
+      - "127.0.0.1:4003:4001"  # Live API port: container 4001 -> host 4003 (localhost only)
+      - "127.0.0.1:4004:4002"  # Paper API port: container 4002 -> host 4004 (localhost only)
+      - "127.0.0.1:5900:5900"  # VNC port (localhost only)
+
+    volumes:
+      # Persist IB Gateway settings and logs
+      - ib_gateway_data:/opt/ibc
+      - ib_gateway_logs:/root/Jts
 
 volumes:
   postgres_data:
+  prometheus_data:
+  grafana_data:
+  ib_gateway_data:
+  ib_gateway_logs:

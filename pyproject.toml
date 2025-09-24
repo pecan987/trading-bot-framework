@@ -26,7 +26,7 @@ classifiers = [
 dependencies = [
     # Core dependencies - essential for framework
     "pandas>=2.0.0",
-    "numpy>=1.24.0",  # Allow numpy 2.x for pandas-ta compatibility
+    "numpy>=1.24.0", # Allow numpy 2.x for pandas-ta compatibility
     # Data sources - required for download and backtesting
     "yfinance>=0.2.18", # Yahoo Finance data
     "ccxt>=4.2.0", # Cryptocurrency exchange data
@@ -38,7 +38,11 @@ dependencies = [
     "tqdm>=4.67.1",
     # Live trading dependencies
     "python-dotenv",
-    "psycopg2-binary",  # PostgreSQL adapter
+    "psycopg2-binary", # PostgreSQL adapter
+    "asyncpg>=0.29.0", # Async PostgreSQL adapter for database logging
+    "ib-async>=0.9.86", # Interactive Brokers API
+    # Monitoring dependencies
+    "prometheus-client>=0.20.0", # Prometheus metrics
 ]
 
 [project.optional-dependencies]

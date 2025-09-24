@@ -38,7 +38,7 @@ class StrategyWrapper(Strategy):
     
     def init(self):
         """Initialize the wrapped strategy."""
-        self.logger = setup_logger("INFO" if not self.__class__.debug else "DEBUG")
+        self.logger = setup_logger("INFO")
         
         # Create instance of framework strategy
         if self.__class__.framework_strategy_class is None:

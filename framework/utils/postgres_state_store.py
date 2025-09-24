@@ -17,7 +17,7 @@ class DatabaseConfig:
     """Database configuration"""
     host: str = 'postgres'
     port: int = 5432
-    database: str = 'trading_bot'
+    database: str = 'trading'
     user: str = 'trading_user'
     password: str = 'trading_password'
     schema: str = 'trading'
@@ -28,7 +28,7 @@ class DatabaseConfig:
         return cls(
             host=os.getenv('DB_HOST', 'postgres'),
             port=int(os.getenv('DB_PORT', '5432')),
-            database=os.getenv('DB_NAME', 'trading_bot'),
+            database=os.getenv('DB_NAME', 'trading'),
             user=os.getenv('DB_USER', 'trading_user'),
             password=os.getenv('DB_PASSWORD', 'trading_password'),
             schema=os.getenv('DB_SCHEMA', 'trading')
@@ -162,6 +162,32 @@ class PostgreSQLStateStore:
                     'exchange': self.exchange
                 }
             )
+    
+    def load_state(self) -> Dict[str, Any]:
+        """Load complete state (positions and orders) from database"""
+        try:
+            positions = self.load_positions()
+            orders = self.load_orders()
+            
+            return {
+                'positions': positions,
+                'orders': orders,
+                'daily_pnl': 0.0  # This could be stored separately if needed
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to load state: {e}")
+            return {}
+    
+    def save_state(self, state: Dict[str, Any]) -> None:
+        """Save complete state (positions and orders) to database"""
+        try:
+            if 'positions' in state:
+                self.save_positions(state['positions'])
+            if 'orders' in state:
+                self.save_orders(state['orders'])
+            # Could also save daily_pnl if needed
+        except Exception as e:
+            self.logger.error(f"Failed to save state: {e}")
     
     def load_positions(self) -> Dict[str, Any]:
         """Load positions from database"""
