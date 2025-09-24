@@ -210,7 +210,7 @@ class IBKRConnection:
                 durationStr=duration,
                 barSizeSetting=bar_size,
                 whatToShow=what_to_show,
-                useRTH=True,
+                useRTH=False,
                 timeout=30  # 30 second timeout
             )
             

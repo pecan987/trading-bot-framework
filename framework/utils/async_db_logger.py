@@ -298,6 +298,7 @@ class AsyncDatabaseLogger:
                     'symbol': symbol,
                     'quantity': quantity,
                     'entry_price': entry_price,
+                    'exit_price': exit_price,
                     'side': side,
                     'strategy': strategy,
                     'stop_loss': stop_loss,

@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from ib_async import MarketOrder, LimitOrder, StopOrder
 from framework.utils.logger import setup_logger
+from framework.utils.async_db_logger import get_db_logger
 from .ibkr_config import IBKRConfig
 from .ibkr_connection import IBKRConnection
 
@@ -46,6 +47,19 @@ class IBKRTrader:
         self.connection = IBKRConnection(self.ibkr_config)
         self.logger = setup_logger("INFO")
         
+        # Initialize database logging - auto-detect PostgreSQL availability
+        self.db_logging_enabled = False
+        self.db_logger = None
+        
+        # Try to initialize database logger (auto-detect PostgreSQL)
+        try:
+            self.db_logger = get_db_logger()
+            self.db_logging_enabled = True
+            self.logger.info("Database logging enabled (PostgreSQL detected)")
+        except Exception as e:
+            self.logger.info(f"Database logging disabled (PostgreSQL not available: {e})")
+            self.db_logging_enabled = False
+        
         # State tracking
         self.positions = {}
         
@@ -70,6 +84,13 @@ class IBKRTrader:
     def cleanup(self):
         """Cleanup method for main.py compatibility"""
         self.connection.disconnect()
+        
+        # Close database logger
+        if self.db_logging_enabled and self.db_logger:
+            try:
+                self.db_logger.close()
+            except Exception as e:
+                self.logger.warning(f"Error closing database logger: {e}")
     
     def _sync_positions(self):
         """Sync positions from IBKR"""
@@ -136,7 +157,7 @@ class IBKRTrader:
                 duration = f"{max(lookback * 4, 24)} H"  # Give more buffer for smaller timeframes
             
             # Request historical data
-            self.logger.debug(f"Requesting {lookback} bars of {symbol} ({bar_size})")
+            self.logger.info(f"Requesting {duration} bars of {symbol} ({bar_size})")
             
             bars = self.connection.get_historical_data(
                 contract=contract,
@@ -308,6 +329,49 @@ class IBKRTrader:
                     # Wait for order to process
                     time.sleep(0.5)
                     self.logger.info(f"✓ Buy order placed: {quantity} {symbol}")
+                    
+                    # Log trade to database
+                    if self.db_logging_enabled and self.db_logger:
+                        try:
+                            self.db_logger.log_trade(
+                                trade_id=f"ibkr_{symbol}_{int(time.time())}_{trade.order.orderId if hasattr(trade, 'order') else 'unknown'}",
+                                symbol=symbol,
+                                side='buy',
+                                quantity=quantity,
+                                price=price,
+                                status='filled',
+                                order_type='market',
+                                strategy=getattr(self.main_config, 'strategy_name', None) if self.main_config else None,
+                                executed_at=time.time(),
+                                metadata={
+                                    'exchange': 'IBKR',
+                                    'action_type': 'open_long',
+                                    'stop_loss': stop_loss,
+                                    'take_profit': take_profit
+                                }
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to log buy trade to database: {e}")
+                    
+                    # Log position opening to database
+                    if self.db_logging_enabled and self.db_logger:
+                        try:
+                            self.db_logger.update_position(
+                                symbol=symbol,
+                                quantity=quantity,
+                                entry_price=price,
+                                side='long',
+                                strategy=getattr(self.main_config, 'strategy_name', None) if self.main_config else None,
+                                stop_loss=stop_loss,
+                                take_profit=take_profit,
+                                metadata={
+                                    'exchange': 'IBKR',
+                                    'open_time': time.time()
+                                }
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to log position opening to database: {e}")
+                    
                     return True
                 else:
                     return False
@@ -342,6 +406,49 @@ class IBKRTrader:
                     # Wait for order to process
                     time.sleep(0.5)
                     self.logger.info(f"✓ Sell order placed: {quantity} {symbol}")
+                    
+                    # Log trade to database
+                    if self.db_logging_enabled and self.db_logger:
+                        try:
+                            self.db_logger.log_trade(
+                                trade_id=f"ibkr_{symbol}_{int(time.time())}_{trade.order.orderId if hasattr(trade, 'order') else 'unknown'}",
+                                symbol=symbol,
+                                side='sell',
+                                quantity=quantity,
+                                price=price,
+                                status='filled',
+                                order_type='market',
+                                strategy=getattr(self.main_config, 'strategy_name', None) if self.main_config else None,
+                                executed_at=time.time(),
+                                metadata={
+                                    'exchange': 'IBKR',
+                                    'action_type': 'open_short',
+                                    'stop_loss': stop_loss,
+                                    'take_profit': take_profit
+                                }
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to log sell trade to database: {e}")
+                    
+                    # Log position opening to database
+                    if self.db_logging_enabled and self.db_logger:
+                        try:
+                            self.db_logger.update_position(
+                                symbol=symbol,
+                                quantity=-quantity,  # Negative for short
+                                entry_price=price,
+                                side='short',
+                                strategy=getattr(self.main_config, 'strategy_name', None) if self.main_config else None,
+                                stop_loss=stop_loss,
+                                take_profit=take_profit,
+                                metadata={
+                                    'exchange': 'IBKR',
+                                    'open_time': time.time()
+                                }
+                            )
+                        except Exception as e:
+                            self.logger.warning(f"Failed to log position opening to database: {e}")
+                    
                     return True
                 else:
                     return False
@@ -371,6 +478,49 @@ class IBKRTrader:
             if trade:
                 time.sleep(0.5)
                 self.logger.info(f"✓ Position closed: {symbol}")
+                
+                # Log close trade to database
+                if self.db_logging_enabled and self.db_logger:
+                    try:
+                        self.db_logger.log_trade(
+                            trade_id=f"ibkr_{symbol}_close_{int(time.time())}_{trade.order.orderId if hasattr(trade, 'order') else 'unknown'}",
+                            symbol=symbol,
+                            side=action.lower(),
+                            quantity=quantity,
+                            price=price,
+                            status='filled',
+                            order_type='market',
+                            strategy=getattr(self.main_config, 'strategy_name', None) if self.main_config else None,
+                            executed_at=time.time(),
+                            metadata={
+                                'exchange': 'IBKR',
+                                'action_type': 'close_position',
+                                'original_side': 'long' if current_size > 0 else 'short'
+                            }
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to log close trade to database: {e}")
+                
+                # Log position close to database
+                if self.db_logging_enabled and self.db_logger:
+                    try:
+                        entry_price = position.get('entry_price', 0.0)
+                        self.db_logger.update_position(
+                            symbol=symbol,
+                            quantity=0,  # Closing position
+                            entry_price=entry_price,
+                            exit_price=price,
+                            side='long' if current_size > 0 else 'short',
+                            strategy=getattr(self.main_config, 'strategy_name', None) if self.main_config else None,
+                            metadata={
+                                'exchange': 'IBKR',
+                                'close_time': time.time(),
+                                'action_type': 'close_position'
+                            }
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Failed to log position close to database: {e}")
+                
                 return True
             else:
                 return False
@@ -450,10 +600,58 @@ class IBKRTrader:
             self.logger.error(f"Failed to calculate quantity: {e}")
             return 1  # Fallback to 1 share
     
+    def log_account_balance(self) -> bool:
+        """Log current account balance to database"""
+        try:
+            if not self.db_logging_enabled or not self.db_logger:
+                return False
+            
+            if not self.connection.is_connected():
+                return False
+            
+            # Get account information
+            account_summary = self.connection.get_account_summary()
+            if not account_summary:
+                return False
+            
+            # Extract balance information
+            total_cash_value = 0.0
+            net_liquidation_value = 0.0
+            
+            for value in account_summary:
+                if value.tag == 'TotalCashValue' and value.currency == 'USD':
+                    total_cash_value = float(value.value)
+                elif value.tag == 'NetLiquidation' and value.currency == 'USD':
+                    net_liquidation_value = float(value.value)
+            
+            # Log to database
+            self.db_logger.log_balance(
+                account_id=self.connection.get_managed_accounts()[0] if self.connection.get_managed_accounts() else 'unknown',
+                total_balance=net_liquidation_value,
+                free_balance=total_cash_value,
+                used_balance=net_liquidation_value - total_cash_value,
+                currency='USD',
+                metadata={
+                    'exchange': 'IBKR',
+                    'snapshot_time': time.time()
+                }
+            )
+            
+            self.logger.debug(f"Balance logged: Total=${net_liquidation_value:.2f}, Free=${total_cash_value:.2f}")
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to log account balance: {e}")
+            return False
+    
     def get_performance_summary(self) -> dict:
         """Get basic performance summary"""
         try:
             total_positions = len(self.positions)
+            
+            # Log balance if database logging is enabled
+            if self.db_logging_enabled:
+                self.log_account_balance()
             
             return {
                 'connected': self.connection.is_connected(),

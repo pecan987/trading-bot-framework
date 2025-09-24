@@ -108,14 +108,14 @@ class CCXTTrader:
         # Initialize risk manager
         self.risk_manager = self._initialize_risk_manager(config)
         
-        # Database logger
+        # Database logger - auto-detect PostgreSQL availability
         from framework.utils.async_db_logger import get_db_logger
         try:
             self.db_logger = get_db_logger()
             self.db_logging_enabled = True
-            self.logger.info("Database logging enabled")
+            self.logger.info("Database logging enabled (PostgreSQL detected)")
         except Exception as e:
-            self.logger.warning(f"Failed to initialize database logger: {e}")
+            self.logger.info(f"Database logging disabled (PostgreSQL not available: {e})")
             self.db_logger = None
             self.db_logging_enabled = False
         
@@ -939,6 +939,7 @@ class CCXTTrader:
                         symbol=symbol,
                         quantity=0,
                         entry_price=current_position.get('entry_price', average_price),
+                        exit_price=average_price,
                         side=current_position.get('side', 'long'),
                         strategy=getattr(self.config, 'strategy_name', None),
                         metadata={
