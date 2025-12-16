@@ -55,7 +55,11 @@ def load_data(file_path: str, start_date: Optional[str] = None,
     
     # Load CSV file
     df = pd.read_csv(file_path, index_col=0, parse_dates=True)
-    
+
+    # Ensure index is DatetimeIndex (handles timezone-aware strings)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True)
+
     # Filter by date range
     if start_date:
         df = df[df.index >= start_date]
